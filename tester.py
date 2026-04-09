@@ -60,7 +60,7 @@ def read_column_c(filepath: str) -> list[float]:
 # RUN BATTERY OPTIMIZER SCRIPT ON THE 96 VALUES TO GET A LIST OF 96 SlotResults
 def battery_optimizer_run(prices: list[float]):
     state = StationState(
-        station_power = 0.28,   # P = 80 MW
+        station_power = 0.31,   # P = 80 MW
         battery_level = 0,   # starting with 10 MWh stored
     )
 
