@@ -5,8 +5,10 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.drawing.colors import ColorChoice, SchemeColor
 import pandas as pd
 from pathlib import Path
-from datetime import time
+from datetime import datetime, time, date
 import math
+from nordpool import elspot
+import pytz
 
 from battery_optimizer import (
     BatteryAction,
@@ -86,8 +88,11 @@ def time_to_slot(t: time) -> int:
     slot = total_minutes / SLOT_DURATION_MINS
     return math.ceil(slot) % SLOTS_PER_DAY
 
-def battery_optimizer_run(prices: list[float], state: StationState, slots_elapsed: int):
 
+def battery_optimizer_run(prices: list[float], state: StationState, slots_elapsed: int):
+    """
+    Run the battery optimizer and return the result, starting from the given state and slot index.
+    """
     print("=" * 78)
     print("  Run optimisation from 00:00")
     print(f"  P = {state.station_power:.4f} MW  |  "
@@ -101,5 +106,62 @@ def battery_optimizer_run(prices: list[float], state: StationState, slots_elapse
             updated_state    = state,
             slots_elapsed    = slots_elapsed,
         )
-    
     return result
+
+
+def fetch_prices():
+    """
+    Fetch electricity prices from nordpool for today and tomorrow,
+    Converts prices to Riga timezone and filters out prices before 14:00 today.
+    Returns: dictionary with "datetime" and "price" lists.
+    throws: ValueError if tomorrow's prices cannot be fetched (e.g. not available yet).
+    """
+    riga_tz = pytz.timezone('Europe/Riga')
+    now = datetime.now(riga_tz)
+    target = now.replace(hour=14, minute=0, second=0, microsecond=0) # 14:00 today
+
+    prices_spot = elspot.Prices()
+    today_prices = prices_spot.fetch( # get todays prices
+        end_date=date.today(),
+        areas=["LV"],
+        resolution=15,
+    )
+    tomorrow_prices = prices_spot.fetch( # get tomorrows prices
+        areas=["LV"],
+        resolution=15,
+    )
+
+    # Check if prices were successfully fetched
+    if not tomorrow_prices:
+        raise ValueError("Failed to fetch tomorrow's prices. Prices might not be available yet.")
+    
+    prices_list = {
+    "datetime": [],
+    "price": [],
+    }
+
+    # add prices to prices_list, converting timestamps to Riga timezone
+    for entry in today_prices["areas"]["LV"]["values"]:
+        prices_list["datetime"].append(entry["start"].astimezone(riga_tz))
+        prices_list["price"].append(entry["value"])
+
+    for entry in tomorrow_prices["areas"]["LV"]["values"]:
+        prices_list["datetime"].append(entry["start"].astimezone(riga_tz))
+        prices_list["price"].append(entry["value"])
+
+    # Filter out prices that are before the target time
+    prices_list["datetime"], prices_list["price"] = zip(*[
+        (dt, price) for dt, price in zip(prices_list["datetime"], prices_list["price"])
+        if dt >= target
+    ])
+
+    return prices_list
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+
+    prices_list = fetch_prices()
+
+    print(len(prices_list["price"]))
+    print(prices_list)
