@@ -16,6 +16,7 @@ from nordpool import elspot
 import pytz
 import bisect
 import shutil
+import os
 
 
 from battery_optimizer import (
@@ -43,6 +44,7 @@ bottom_unusable_pct = 12 # 12% of battery capacity is unusable (bottom)
 top_unusable_pct = 5 # 5% of battery capacity is unusable (top)
 red_line_threshold = 12.5 # EUR/MWh - price labels below this will be colored red
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- Domain types ---
 
@@ -289,17 +291,19 @@ if __name__ == "__main__":
           f"Expected revenue: {result.total_revenue:.2f} EUR")
     print("="*78)
     
+    src_filepath = os.path.join(SCRIPT_DIR, "excel_template.xlsx")
+    dst_filepath = os.path.join(SCRIPT_DIR, "output.xlsx")
 
     print("Duplicating template file...")
-    duplicate_excel(src_path="excel_template.xlsx", dst_path="output.xlsx")
+    duplicate_excel(src_path=src_filepath, dst_path=dst_filepath)
 
     print("Replacing prices in output file...")
-    replace_column_c("output.xlsx", prices_list["price"])
+    replace_column_c(dst_filepath, prices_list["price"])
 
     print("Coloring chart bars in output file...")
-    color_chart_bars("output.xlsx", result.schedule, start_index=slot_index)
+    color_chart_bars(dst_filepath, result.schedule, start_index=slot_index)
 
     print("Coloring labels below threshold in output file...")
-    color_label_text_below_threshold("output.xlsx", prices_list["price"], red_line_threshold)
+    color_label_text_below_threshold(dst_filepath, prices_list["price"], red_line_threshold)
 
     print("Done. Output saved to output.xlsx")
