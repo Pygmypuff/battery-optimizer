@@ -4,6 +4,7 @@ from enum import Enum
 from openpyxl import load_workbook, Workbook
 from openpyxl.drawing.colors import ColorChoice, SchemeColor
 import pandas as pd
+from pathlib import Path
 
 from battery_optimizer import (
     BatteryAction,
@@ -60,7 +61,7 @@ def read_column_c(filepath: str) -> list[float]:
 # RUN BATTERY OPTIMIZER SCRIPT ON THE 96 VALUES TO GET A LIST OF 96 SlotResults
 def battery_optimizer_run(prices: list[float]):
     state = StationState(
-        station_power = 0.31,   # P = 80 MW
+        station_power = 0.35,   # P = 80 MW
         battery_level = 0,   # starting with 10 MWh stored
     )
 
@@ -68,12 +69,30 @@ def battery_optimizer_run(prices: list[float]):
 
     print("=" * 78)
     print("  Full-day optimisation from 00:00")
-    print(f"  P = {state.station_power*1000:.0f} MW  |  "
+    print(f"  P = {state.station_power::.4f} MW  |  "
           f"Computed ratio X = {ratio:.4f}  |  "
-          f"Battery = {state.battery_level*1000:.0f} MWh")
+          f"Battery = {state.battery_level:.4f} MWh")
     print("=" * 78)
 
     result = optimise_battery_schedule(prices=prices, cfg=BASE_CFG, state=state)
+    return result
+
+def battery_optimizer_rerun(prices: list[float], updated_state: StationState, slots_elapsed: int):
+
+    print("=" * 78)
+    print("  R-run optimisation from 00:00")
+    print(f"  P = {updated_state.station_power:.4f} MW  |  "
+          f"Computed ratio X = {compute_charge_discharge_ratio(updated_state.station_power, BASE_CFG):.4f}  |  "
+          f"Battery = {updated_state.battery_level:.4f} MWh")
+    print("=" * 78)
+
+    result = rerun_for_remaining_day(
+            remaining_prices = prices[slots_elapsed:],
+            cfg              = BASE_CFG,
+            updated_state    = updated_state,
+            slots_elapsed    = slots_elapsed,
+        )
+    
     return result
 
 # --- Step 2: Copy sheets into a new workbook ---
@@ -167,12 +186,23 @@ def process_bess(src_path: str, dst_path: str) -> list[float]:
     print("Running battery optimizer...")
     result = battery_optimizer_run(values)
 
+    print("Re-Running battery optimizer...")
+    state = StationState(
+        station_power = 0.35,   # P = 80 MW
+        battery_level = 0.16776,   # starting with 10 MWh stored
+    )
+
+    result_rerun = battery_optimizer_rerun(values, state, slots_elapsed=46)
+
+    print("Combining results...")
+    result_final_schedule = result.schedule[:46] + result_rerun.schedule
+
     print("Copying 'Sheet1' and 'BESS (15)' to new file...")
     copy_sheets_to_new_workbook(src_path, ["Sheet1", "BESS (15)"], dst_path)
     print(f"  Saved to {dst_path}")
 
     print("Coloring chart bars...")
-    color_chart_bars(dst_path, result.schedule)
+    color_chart_bars(dst_path, result_final_schedule)
     print("  Done.")
 
     return result
