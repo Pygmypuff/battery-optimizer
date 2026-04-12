@@ -17,6 +17,8 @@ import pytz
 import bisect
 import shutil
 import os
+import re
+import zipfile
 
 
 from battery_optimizer import (
@@ -67,7 +69,7 @@ class SlotResult:
 COLOR_MAP = {
     BatteryAction.CHARGE:    "4169E1",  # blue
     BatteryAction.DISCHARGE: "ED7D31",  # orange
-    BatteryAction.HOLD:      "A6A6A6",  # grey
+    BatteryAction.HOLD:      "828481",  # grey
 }
 
 def calculate_usable_battery_capacity(battery_percentage: float) -> float:
@@ -77,6 +79,8 @@ def calculate_usable_battery_capacity(battery_percentage: float) -> float:
     Input: total battery capacity percentage
     Output: usable battery capacity in MWh
     """
+    if battery_percentage < bottom_unusable_pct: # returns 0 if battery is in the unusable bottom range
+        return 0.0
     usable_capacity = total_battery_capacity * (battery_percentage - bottom_unusable_pct) / 100
     return usable_capacity
 
@@ -255,7 +259,79 @@ def color_label_text_below_threshold(
 
     wb.save(filepath)
 
-
+def apply_chart_background(filepath: str) -> None:
+    """
+    Injects a gradient background into the chart XML to visually distinguish between 24h segments.
+ 
+    IMPORTANT: Call this AFTER all openpyxl wb.save() calls
+    """
+    # Gradient stop positions (units: 1/1000 of a percent, 0–100 000)
+    s1_end = round(40 / 140 * 100_000)   # 28571 — end of first white band
+    s2_end = round(136 / 140 * 100_000)  # 97143 — end of grey band
+ 
+    # Read all files from the xlsx zip
+    files: dict[str, bytes] = {}
+    with zipfile.ZipFile(filepath, "r") as z:
+        for name in z.namelist():
+            files[name] = z.read(name)
+ 
+    chart_xml = files["xl/charts/chart1.xml"].decode("utf-8")
+ 
+    # openpyxl strips namespace prefixes on save (e.g. <c:plotArea> → <plotArea>)
+    # so we detect which form is present and adapt accordingly.
+    if "</c:plotArea>" in chart_xml:
+        close_tag = "</c:plotArea>"
+        open_spPr = (
+            '<c:spPr'
+            ' xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"'
+            ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        )
+        close_spPr = "</c:spPr>"
+    else:
+        close_tag = "</plotArea>"
+        open_spPr = '<spPr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        close_spPr = "</spPr>"
+ 
+    gradient_spPr = (
+        open_spPr
+        + "<a:gradFill><a:gsLst>"
+        + '<a:gs pos="0"><a:srgbClr val="FFFFFF"/></a:gs>'
+        + f'<a:gs pos="{s1_end}"><a:srgbClr val="FFFFFF"/></a:gs>'
+        + f'<a:gs pos="{s1_end + 1}"><a:srgbClr val="E0E0E0"/></a:gs>'
+        + f'<a:gs pos="{s2_end}"><a:srgbClr val="E0E0E0"/></a:gs>'
+        + f'<a:gs pos="{s2_end + 1}"><a:srgbClr val="FFFFFF"/></a:gs>'
+        + '<a:gs pos="100000"><a:srgbClr val="FFFFFF"/></a:gs>'
+        + "</a:gsLst>"
+        + '<a:lin ang="0" scaled="0"/>'
+        + "</a:gradFill>"
+        + "<a:ln><a:noFill/></a:ln>"
+        + close_spPr
+    )
+ 
+    # Remove any previously injected plotArea spPr (makes this call idempotent)
+    for open_pat, close_pat in [
+        (r"<c:spPr[^>]*>", r"</c:spPr>\s*</c:plotArea>"),
+        (r"<spPr[^>]*>",   r"</spPr>\s*</plotArea>"),
+    ]:
+        chart_xml = re.sub(
+            open_pat + r".*?" + close_pat,
+            close_tag,
+            chart_xml,
+            count=1,
+            flags=re.DOTALL,
+        )
+ 
+    # Inject the gradient spPr immediately before </plotArea>
+    chart_xml = chart_xml.replace(close_tag, gradient_spPr + close_tag, 1)
+ 
+    files["xl/charts/chart1.xml"] = chart_xml.encode("utf-8")
+ 
+    # Write back atomically
+    tmp = filepath + ".tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in files.items():
+            zout.writestr(name, data)
+    os.replace(tmp, filepath)
 
 
 
@@ -306,5 +382,8 @@ if __name__ == "__main__":
 
     print("Coloring labels below threshold in output file...")
     color_label_text_below_threshold(dst_filepath, prices_list["price"], red_line_threshold)
+
+    print("Applying chart background in output file...") 
+    apply_chart_background(dst_filepath) # This must be called last
 
     print("Done. Output saved to output.xlsx")
