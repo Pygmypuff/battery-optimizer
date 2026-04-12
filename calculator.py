@@ -267,6 +267,7 @@ def color_label_text_below_threshold(
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
+    print("Fetching prices from nordpool...")
     prices_list = fetch_prices()
     print("="*78)
     print(f"Fetched {len(prices_list['price'])} electricity prices")
@@ -281,7 +282,7 @@ if __name__ == "__main__":
     result = battery_optimizer_run(
         prices = prices_list["price"],
         state = StationState(
-            station_power = 0.350,
+            station_power = 0.310,
             battery_level = calculate_usable_battery_capacity(12),
         ),
         slots_elapsed = slot_index,
