@@ -1,3 +1,4 @@
 *.xlsx
+*.csv
 
 !excel_template.xlsx
