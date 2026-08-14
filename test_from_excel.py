@@ -21,9 +21,10 @@ Input file expectations (sheet "BESS (15)" by default):
 This script intentionally does NOT import calculator.py, because
 calculator.py imports the `nordpool` package at module scope purely to
 fetch live prices, which isn't needed for offline testing and may not even
-be installed in a test environment. Instead it duplicates the small pieces
-of calculator.py needed (BASE_CFG, calculate_usable_battery_capacity), so
-if you tune those in calculator.py, update them here too.
+be installed in a test environment. Config values (StationConfig fields,
+total_battery_capacity, bottom_unusable_pct, red_line_threshold) come from
+station_config.py instead, which both this script and calculator.py share
+— editable from the GUI's config window, with no nordpool dependency.
 
 Optionally also writes a clean, single-sheet formatted .xlsx (schedule
 table + colored bar chart matching calculator.py's chart styling: blue for
@@ -64,23 +65,16 @@ from battery_optimizer import (
     optimise_battery_schedule,
     print_schedule,
 )
+from station_config import calculate_usable_battery_capacity, load_config
 
-# ---------------------------------------------------------------------------
-# Mirrors calculator.py — keep in sync if those values change there.
-# ---------------------------------------------------------------------------
-
-BASE_CFG = StationConfig(
-    max_charge_rate=0.4,       # C   (MW)
-    max_sell_rate=0.5,         # S   (MW)
-    battery_capacity=0.77353,  # B   (MWh)
-    min_price_delta=40,        # Y   (EUR/MWh)
-    min_discharge_price=52.5,  # T   (EUR/MWh)
-    discharge_loss_pct=2,      # 0-100 (%)
-)
-
-total_battery_capacity = 0.932  # MWh (100% battery capacity) (233*4 kWh)
-bottom_unusable_pct = 12        # 12% of battery capacity is unusable (bottom)
-red_line_threshold = 12.5       # EUR/MWh - price labels below this are colored red
+# Snapshot for module-level defaults (e.g. the --threshold CLI flag's
+# default). process_one_file() always reloads fresh via load_config() so a
+# change saved from the GUI's config window applies on the very next run.
+_DEFAULT_APP_CFG = load_config()
+BASE_CFG = _DEFAULT_APP_CFG.station_config()
+total_battery_capacity = _DEFAULT_APP_CFG.total_battery_capacity
+bottom_unusable_pct = _DEFAULT_APP_CFG.bottom_unusable_pct
+red_line_threshold = _DEFAULT_APP_CFG.red_line_threshold
 
 COLOR_MAP = {
     BatteryAction.CHARGE:    "4169E1",  # blue
@@ -98,13 +92,6 @@ def _make_txPr(hex_color: str) -> RichText:
     para = Paragraph(pPr=pPr, endParaRPr=CharacterProperties())
     bodyPr = RichTextProperties(rot=-5400000, anchor="ctr", anchorCtr=True)
     return RichText(bodyPr=bodyPr, lstStyle=ListStyle(), p=[para])
-
-
-def calculate_usable_battery_capacity(battery_percentage: float) -> float:
-    """Copied from calculator.py — usable MWh from a total-battery %."""
-    if battery_percentage < bottom_unusable_pct:
-        return 0.0
-    return total_battery_capacity * (battery_percentage - bottom_unusable_pct) / 100
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +369,12 @@ def process_one_file(
     csv_out: str | None,
     xlsx_out: str | None,
 ) -> None:
+    # Reload config fresh on every run so a change saved from the GUI's
+    # config window takes effect on the very next run, without needing to
+    # restart the app.
+    app_cfg = load_config()
+    cfg = app_cfg.station_config()
+
     print(f"Reading inputs from '{excel_path}' (sheet '{sheet}')...")
     inputs = read_inputs_from_excel(excel_path, sheet, power_unit)
     print(f"  Station power : {inputs.station_power_mw:.4f} MW "
@@ -389,7 +382,7 @@ def process_one_file(
     print(f"  Prices        : {len(inputs.prices)} slots, "
           f"{inputs.prices[0]:.2f}..{inputs.prices[-1]:.2f} EUR/MWh")
 
-    battery_level = calculate_usable_battery_capacity(battery_pct)
+    battery_level = calculate_usable_battery_capacity(battery_pct, app_cfg)
     state = StationState(
         station_power=inputs.station_power_mw,
         battery_level=battery_level,
@@ -400,7 +393,7 @@ def process_one_file(
     print("Running optimiser...")
     result = optimise_battery_schedule(
         prices=inputs.prices,
-        cfg=BASE_CFG,
+        cfg=cfg,
         state=state,
         start_slot=0,
     )

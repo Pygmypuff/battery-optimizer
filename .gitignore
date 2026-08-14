@@ -2,3 +2,7 @@
 *.csv
 
 !excel_template.xlsx
+
+# Local, per-machine override of station_config.py's defaults — saved by
+# the GUI's config window (gui/config_window.py).
+config.json

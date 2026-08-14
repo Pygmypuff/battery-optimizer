@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui.config_window import ConfigDialog
 from gui.runners import run_nordpool_mode, run_test_mode
 from gui.worker import RunWorker
 
@@ -173,9 +174,13 @@ class MainWindow(QMainWindow):
         self.open_output_button.setEnabled(False)
         self.open_output_button.clicked.connect(self._open_output)
 
+        self.settings_button = QPushButton("Settings…")
+        self.settings_button.clicked.connect(self._open_settings)
+
         bottom_row = QHBoxLayout()
         bottom_row.addWidget(self.status_label)
         bottom_row.addStretch()
+        bottom_row.addWidget(self.settings_button)
         bottom_row.addWidget(self.open_output_button)
 
         central = QWidget()
@@ -228,6 +233,9 @@ class MainWindow(QMainWindow):
     def _open_output(self) -> None:
         if self._last_output_path is not None:
             open_file_with_default_app(self._last_output_path)
+
+    def _open_settings(self) -> None:
+        ConfigDialog(self).exec()
 
 
 def main() -> None:

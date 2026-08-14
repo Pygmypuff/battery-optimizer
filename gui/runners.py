@@ -12,6 +12,7 @@ from pathlib import Path
 
 import calculator
 import test_from_excel
+from station_config import load_config
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR  = PROJECT_DIR / "gui_output"
@@ -30,13 +31,18 @@ def run_test_mode(excel_path: Path) -> Path:
     csv_out  = OUTPUT_DIR / f"{stem}_schedule.csv"
     template = PROJECT_DIR / "excel_template.xlsx"
 
+    # Loaded fresh (not test_from_excel.red_line_threshold, a stale
+    # snapshot from import time) so a config change saved from the GUI
+    # applies on the very next run.
+    threshold = load_config().red_line_threshold
+
     test_from_excel.process_one_file(
         excel_path=str(excel_path),
         sheet="BESS (15)",
         power_unit="kw",
         battery_pct=12.0,
         initial_charge_price=0.0,
-        threshold=test_from_excel.red_line_threshold,
+        threshold=threshold,
         template=str(template),
         csv_out=str(csv_out),
         xlsx_out=str(xlsx_out),

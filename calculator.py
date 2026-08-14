@@ -30,21 +30,23 @@ from battery_optimizer import (
     print_schedule,
     rerun_for_remaining_day,
 )
+from station_config import calculate_usable_battery_capacity, load_config
 
-BASE_CFG = StationConfig(
-    max_charge_rate =      0.4, # C   (MW)
-    max_sell_rate =        0.5, # S   (MW)
-    battery_capacity =     0.77353, # B   (MWh)
-    min_price_delta =      40, # Y   (EUR/MWh)
-    min_discharge_price =  52.5, # T   (EUR/MWh)
-    discharge_loss_pct =   2, # 0–100 (%)
-)
+# Config values (StationConfig fields, total_battery_capacity,
+# bottom_unusable_pct, red_line_threshold) now live in station_config.py /
+# config.json, editable from the GUI's config window. This module-level
+# snapshot is only a fallback default for callers that don't go through
+# run_nordpool() (e.g. direct StationConfig-needing calls); run_nordpool()
+# itself always reloads fresh so GUI-saved changes apply on the next run
+# without restarting the app.
+_DEFAULT_APP_CFG = load_config()
+BASE_CFG = _DEFAULT_APP_CFG.station_config()
 
 # OTHER CONFIG VALUES
-total_battery_capacity = 0.932 # MWh (100% battery capacity) (233*4 kWh)
-bottom_unusable_pct = 12 # 12% of battery capacity is unusable (bottom)
-top_unusable_pct = 5 # 5% of battery capacity is unusable (top)
-red_line_threshold = 12.5 # EUR/MWh - price labels below this will be colored red
+total_battery_capacity = _DEFAULT_APP_CFG.total_battery_capacity
+bottom_unusable_pct = _DEFAULT_APP_CFG.bottom_unusable_pct
+top_unusable_pct = 5 # 5% of battery capacity is unusable (top) — not currently used below
+red_line_threshold = _DEFAULT_APP_CFG.red_line_threshold
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -72,19 +74,6 @@ COLOR_MAP = {
     BatteryAction.HOLD:      "828481",  # grey
 }
 
-def calculate_usable_battery_capacity(battery_percentage: float) -> float:
-    """
-    Calculate the usable battery capacity from total battery percentage.
-    We are not using the bottom 12% and top 5% of the battery.
-    Input: total battery capacity percentage
-    Output: usable battery capacity in MWh
-    """
-    if battery_percentage < bottom_unusable_pct: # returns 0 if battery is in the unusable bottom range
-        return 0.0
-    usable_capacity = total_battery_capacity * (battery_percentage - bottom_unusable_pct) / 100
-    return usable_capacity
-
-
 def datetime_to_slot_index(dt: datetime, slots: list[datetime]) -> int:
     """
     Return the index in *slots* of the first datetime >= *dt*.
@@ -103,20 +92,20 @@ def datetime_to_slot_index(dt: datetime, slots: list[datetime]) -> int:
     return index
 
 
-def battery_optimizer_run(prices: list[float], state: StationState, slots_elapsed: int):
+def battery_optimizer_run(prices: list[float], state: StationState, slots_elapsed: int, cfg: StationConfig):
     """
     Run the battery optimizer and return the result, starting from the given state and slot index.
     """
     print("=" * 78)
     print(f"  P = {state.station_power:.4f} MW  |  "
           f"Charge:discharge ratio X (informational only, not a solver "
-          f"constraint) = {compute_charge_discharge_ratio(state.station_power, BASE_CFG):.4f}  |  "
+          f"constraint) = {compute_charge_discharge_ratio(state.station_power, cfg):.4f}  |  "
           f"Battery = {state.battery_level:.4f} MWh")
     print("=" * 78)
 
     result = rerun_for_remaining_day(
             remaining_prices = prices[slots_elapsed:],
-            cfg              = BASE_CFG,
+            cfg              = cfg,
             updated_state    = state,
             slots_elapsed    = slots_elapsed,
         )
@@ -359,6 +348,12 @@ def run_nordpool(
     this module — callers that want to capture it (e.g. a GUI) can redirect
     stdout around the call.
     """
+    # Reload config fresh on every run so a change saved from the GUI's
+    # config window takes effect on the very next run, without needing to
+    # restart the app.
+    app_cfg = load_config()
+    cfg = app_cfg.station_config()
+
     out_dir = Path(output_dir) if output_dir is not None else Path(SCRIPT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -378,10 +373,11 @@ def run_nordpool(
         prices=prices_list["price"],
         state=StationState(
             station_power=station_power,
-            battery_level=calculate_usable_battery_capacity(battery_pct),
+            battery_level=calculate_usable_battery_capacity(battery_pct, app_cfg),
             initial_charge_price=initial_charge_price,
         ),
         slots_elapsed=slot_index,
+        cfg=cfg,
     )
     print("Battery optimizer run complete.")
     print(f"  BATTERY SCHEDULE  —  {result.slots_optimised} slots  |  "
@@ -402,7 +398,7 @@ def run_nordpool(
     color_chart_bars(dst_filepath, result.schedule, start_index=slot_index)
 
     print("Coloring labels below threshold in output file...")
-    color_label_text_below_threshold(dst_filepath, prices_list["price"], red_line_threshold)
+    color_label_text_below_threshold(dst_filepath, prices_list["price"], app_cfg.red_line_threshold)
 
     print("Applying chart background in output file...")
     apply_chart_background(dst_filepath)  # This must be called last
