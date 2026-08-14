@@ -109,7 +109,8 @@ def battery_optimizer_run(prices: list[float], state: StationState, slots_elapse
     """
     print("=" * 78)
     print(f"  P = {state.station_power:.4f} MW  |  "
-          f"Computed ratio X = {compute_charge_discharge_ratio(state.station_power, BASE_CFG):.4f}  |  "
+          f"Charge:discharge ratio X (informational only, not a solver "
+          f"constraint) = {compute_charge_discharge_ratio(state.station_power, BASE_CFG):.4f}  |  "
           f"Battery = {state.battery_level:.4f} MWh")
     print("=" * 78)
 
@@ -340,36 +341,56 @@ def apply_chart_background(filepath: str) -> None:
 
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+# ── Live (Nordpool) run ──────────────────────────────────────────────────────
+
+def run_nordpool(
+    station_power: float,
+    battery_pct: float = 12.0,
+    initial_charge_price: float = 0.0,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """
+    Fetch live Nordpool prices, run the battery optimizer for the rest of
+    today from the current time onward, and write a formatted output
+    workbook (a copy of excel_template.xlsx with prices filled in and the
+    schedule bars colored). Returns the path to the generated .xlsx file.
+
+    Progress is reported via plain `print()` calls, same as the rest of
+    this module — callers that want to capture it (e.g. a GUI) can redirect
+    stdout around the call.
+    """
+    out_dir = Path(output_dir) if output_dir is not None else Path(SCRIPT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Fetching prices from nordpool...")
     prices_list = fetch_prices()
-    print("="*78)
+    print("=" * 78)
     print(f"Fetched {len(prices_list['price'])} electricity prices")
 
     riga_tz = pytz.timezone('Europe/Riga')
     now = datetime.now(riga_tz)
-    target = now.replace(hour=14, minute=0, second=0, microsecond=0) # 14:00 today
+    target = now.replace(hour=14, minute=0, second=0, microsecond=0)  # 14:00 today
 
     slot_index = datetime_to_slot_index(target, prices_list["datetime"])
-    print(f"Running battery optimizer from {target} (slot index {slot_index})...")   
-    
+    print(f"Running battery optimizer from {target} (slot index {slot_index})...")
+
     result = battery_optimizer_run(
-        prices = prices_list["price"],
-        state = StationState(
-            station_power = 0.310,
-            battery_level = calculate_usable_battery_capacity(12),
+        prices=prices_list["price"],
+        state=StationState(
+            station_power=station_power,
+            battery_level=calculate_usable_battery_capacity(battery_pct),
+            initial_charge_price=initial_charge_price,
         ),
-        slots_elapsed = slot_index,
+        slots_elapsed=slot_index,
     )
     print("Battery optimizer run complete.")
     print(f"  BATTERY SCHEDULE  —  {result.slots_optimised} slots  |  "
           f"Expected revenue: {result.total_revenue:.2f} EUR")
-    print("="*78)
-    
+    print("=" * 78)
+
     src_filepath = os.path.join(SCRIPT_DIR, "excel_template.xlsx")
-    dst_filepath = os.path.join(SCRIPT_DIR, "output.xlsx")
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    dst_filepath = str(out_dir / f"output_{timestamp}.xlsx")
 
     print("Duplicating template file...")
     duplicate_excel(src_path=src_filepath, dst_path=dst_filepath)
@@ -383,7 +404,13 @@ if __name__ == "__main__":
     print("Coloring labels below threshold in output file...")
     color_label_text_below_threshold(dst_filepath, prices_list["price"], red_line_threshold)
 
-    print("Applying chart background in output file...") 
-    apply_chart_background(dst_filepath) # This must be called last
+    print("Applying chart background in output file...")
+    apply_chart_background(dst_filepath)  # This must be called last
 
-    print("Done. Output saved to output.xlsx")
+    print(f"Done. Output saved to {dst_filepath}")
+    return Path(dst_filepath)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    run_nordpool(station_power=0.310)

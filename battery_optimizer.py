@@ -293,6 +293,7 @@ def _finalize_schedule(
     energy_charged:     list[float],
     energy_discharged:  list[float],
     overflow_power:     float,
+    max_charge_energy:  float,
 ) -> OptimisationResult:
     """Turns per-slot charge/discharge amounts into the public result type."""
     num_slots = len(prices)
@@ -313,8 +314,14 @@ def _finalize_schedule(
         if ec > _EPS:
             action = BatteryAction.CHARGE
             battery_level += ec
-            power_sold = overflow_power
-            revenue    = price * overflow_power * t
+            # A charge slot only routes `ec` MWh into the battery when that's
+            # all a profitable pair needed — but the station still produces
+            # the full max_charge_energy this slot regardless. Whatever
+            # wasn't worth storing is sold immediately, same as a HOLD slot
+            # would sell it, instead of silently vanishing from the ledger.
+            unrouted   = max_charge_energy - ec
+            power_sold = overflow_power + unrouted / t
+            revenue    = price * power_sold * t
         elif ed > _EPS:
             action = BatteryAction.DISCHARGE
             battery_level -= ed
@@ -421,7 +428,8 @@ def _greedy_schedule(
         slot_role[j] = 'discharge'
 
     return _finalize_schedule(
-        prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power
+        prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power,
+        max_charge_energy,
     )
 
 
@@ -452,7 +460,8 @@ def _milp_schedule(
     energy_discharged = [0.0] * num_slots
     if n_pairs == 0:
         return _finalize_schedule(
-            prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power
+            prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power,
+            max_charge_energy,
         )
 
     n_vars = n_pairs + num_slots  # [q_0..q_{P-1}, y_0..y_{N-1}]
@@ -512,7 +521,8 @@ def _milp_schedule(
 
     if not rows:
         return _finalize_schedule(
-            prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power
+            prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power,
+            max_charge_energy,
         )
 
     from scipy.sparse import coo_matrix
@@ -547,7 +557,8 @@ def _milp_schedule(
         energy_discharged[j] += q
 
     return _finalize_schedule(
-        prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power
+        prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power,
+        max_charge_energy,
     )
 
 
