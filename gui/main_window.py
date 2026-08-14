@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.config_window import ConfigDialog
-from gui.runners import run_nordpool_mode, run_test_mode
+from gui.runners import run_nordpool_from_now_mode, run_nordpool_mode, run_test_mode
 from gui.worker import RunWorker
 
 
@@ -77,23 +77,34 @@ class LiveRunTab(QWidget):
         self.battery_pct_input.setSuffix(" %")
         self.battery_pct_input.setValue(12.0)
 
-        self.run_button = QPushButton("Run (Nordpool)")
-        self.run_button.clicked.connect(self._handle_run)
+        self.run_1400_button = QPushButton("Run from 14:00")
+        self.run_1400_button.clicked.connect(self._handle_run_from_1400)
+
+        self.run_now_button = QPushButton("Run from now")
+        self.run_now_button.clicked.connect(self._handle_run_from_now)
 
         form = QFormLayout()
         form.addRow("Station power:", self.power_input)
         form.addRow("Current battery level:", self.battery_pct_input)
 
+        buttons_row = QHBoxLayout()
+        buttons_row.addWidget(self.run_1400_button)
+        buttons_row.addWidget(self.run_now_button)
+
         layout = QVBoxLayout(self)
         layout.addLayout(form)
-        layout.addWidget(self.run_button)
+        layout.addLayout(buttons_row)
         layout.addStretch()
 
-    def _handle_run(self) -> None:
+    def _handle_run_from_1400(self) -> None:
         self._on_run(run_nordpool_mode, self.power_input.value(), self.battery_pct_input.value())
 
+    def _handle_run_from_now(self) -> None:
+        self._on_run(run_nordpool_from_now_mode, self.power_input.value(), self.battery_pct_input.value())
+
     def set_running(self, running: bool) -> None:
-        self.run_button.setEnabled(not running)
+        self.run_1400_button.setEnabled(not running)
+        self.run_now_button.setEnabled(not running)
 
 
 class TestModeTab(QWidget):
@@ -223,8 +234,8 @@ class MainWindow(QMainWindow):
 
     def _on_failure(self, message: str) -> None:
         self.status_label.setText("Run failed.")
-        self._append_output("\n" + message)
-        QMessageBox.critical(self, "Run failed", "The run failed — see the console for details.")
+        self._append_output(f"\nRun failed: {message}\n")
+        QMessageBox.critical(self, "Run failed", message)
 
     def _on_thread_finished(self) -> None:
         self.live_tab.set_running(False)

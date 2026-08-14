@@ -21,6 +21,7 @@ import re
 import zipfile
 
 
+from app_paths import output_dir as default_output_dir
 from battery_optimizer import (
     BatteryAction,
     StationConfig,
@@ -332,17 +333,18 @@ def apply_chart_background(filepath: str) -> None:
 
 # ── Live (Nordpool) run ──────────────────────────────────────────────────────
 
-def run_nordpool(
+def _run_nordpool_from(
+    target: datetime,
     station_power: float,
-    battery_pct: float = 12.0,
-    initial_charge_price: float = 0.0,
-    output_dir: str | Path | None = None,
+    battery_pct: float,
+    initial_charge_price: float,
+    output_dir: str | Path | None,
 ) -> Path:
     """
-    Fetch live Nordpool prices, run the battery optimizer for the rest of
-    today from the current time onward, and write a formatted output
-    workbook (a copy of excel_template.xlsx with prices filled in and the
-    schedule bars colored). Returns the path to the generated .xlsx file.
+    Shared implementation for run_nordpool() (from 14:00) and
+    run_nordpool_from_now() (from the current moment): fetch live Nordpool
+    prices, run the battery optimizer starting at `target`, and write a
+    formatted output workbook. Returns the path to the generated .xlsx.
 
     Progress is reported via plain `print()` calls, same as the rest of
     this module — callers that want to capture it (e.g. a GUI) can redirect
@@ -354,17 +356,16 @@ def run_nordpool(
     app_cfg = load_config()
     cfg = app_cfg.station_config()
 
-    out_dir = Path(output_dir) if output_dir is not None else Path(SCRIPT_DIR)
+    # Defaults to the OS-managed per-user output folder (see app_paths.py),
+    # not SCRIPT_DIR — once packaged, SCRIPT_DIR is inside the app bundle,
+    # and generated workbooks would be lost every time the app updates.
+    out_dir = Path(output_dir) if output_dir is not None else default_output_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Fetching prices from nordpool...")
     prices_list = fetch_prices()
     print("=" * 78)
     print(f"Fetched {len(prices_list['price'])} electricity prices")
-
-    riga_tz = pytz.timezone('Europe/Riga')
-    now = datetime.now(riga_tz)
-    target = now.replace(hour=14, minute=0, second=0, microsecond=0)  # 14:00 today
 
     slot_index = datetime_to_slot_index(target, prices_list["datetime"])
     print(f"Running battery optimizer from {target} (slot index {slot_index})...")
@@ -385,7 +386,7 @@ def run_nordpool(
     print("=" * 78)
 
     src_filepath = os.path.join(SCRIPT_DIR, "excel_template.xlsx")
-    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(target.tzinfo).strftime("%Y%m%d_%H%M%S")
     dst_filepath = str(out_dir / f"output_{timestamp}.xlsx")
 
     print("Duplicating template file...")
@@ -405,6 +406,35 @@ def run_nordpool(
 
     print(f"Done. Output saved to {dst_filepath}")
     return Path(dst_filepath)
+
+
+def run_nordpool(
+    station_power: float,
+    battery_pct: float = 12.0,
+    initial_charge_price: float = 0.0,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """Run the optimizer for the rest of today, starting at 14:00 today."""
+    riga_tz = pytz.timezone('Europe/Riga')
+    now = datetime.now(riga_tz)
+    target = now.replace(hour=14, minute=0, second=0, microsecond=0)  # 14:00 today
+    return _run_nordpool_from(target, station_power, battery_pct, initial_charge_price, output_dir)
+
+
+def run_nordpool_from_now(
+    station_power: float,
+    battery_pct: float = 12.0,
+    initial_charge_price: float = 0.0,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """
+    Run the optimizer for the rest of today, starting right now — a mid-day
+    rerun, e.g. after the station's actual power output has drifted from
+    what was assumed at the last 14:00 run.
+    """
+    riga_tz = pytz.timezone('Europe/Riga')
+    now = datetime.now(riga_tz)
+    return _run_nordpool_from(now, station_power, battery_pct, initial_charge_price, output_dir)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

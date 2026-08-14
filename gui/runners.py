@@ -12,14 +12,27 @@ from pathlib import Path
 
 import calculator
 import test_from_excel
+from app_paths import output_dir
 from station_config import load_config
 
+# Bundled, read-only resource (ships with the app, updates with it) — kept
+# relative to the app's own install location, unlike OUTPUT_DIR below.
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-OUTPUT_DIR  = PROJECT_DIR / "gui_output"
+
+# Generated output workbooks. Deliberately NOT relative to PROJECT_DIR:
+# once packaged, that's inside the app bundle, and replacing the whole
+# bundle on update would wipe them. See app_paths.py.
+OUTPUT_DIR = output_dir()
 
 
 def run_nordpool_mode(station_power: float, battery_pct: float) -> Path:
     return calculator.run_nordpool(
+        station_power=station_power, battery_pct=battery_pct, output_dir=OUTPUT_DIR
+    )
+
+
+def run_nordpool_from_now_mode(station_power: float, battery_pct: float) -> Path:
+    return calculator.run_nordpool_from_now(
         station_power=station_power, battery_pct=battery_pct, output_dir=OUTPUT_DIR
     )
 

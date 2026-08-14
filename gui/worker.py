@@ -9,6 +9,7 @@ prints (progress messages, warnings) into the console widget as it happens.
 from __future__ import annotations
 
 import contextlib
+import sys
 import traceback
 from typing import Any, Callable
 
@@ -36,7 +37,11 @@ class RunWorker(QThread):
     -------
     output_line(str)   — a chunk of captured stdout/stderr (progress text).
     succeeded(object)  — the value `target` returned.
-    failed(str)        — a formatted exception, if `target` raised.
+    failed(str)        — str(exception), if `target` raised. The full
+                         traceback still goes to the real (non-redirected)
+                         stderr, so it's visible in the terminal for
+                         debugging — the GUI itself only needs the clean,
+                         human-readable message.
     """
 
     output_line = Signal(str)
@@ -60,7 +65,10 @@ class RunWorker(QThread):
         try:
             with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
                 result = self._target(*self._args, **self._kwargs)
-        except Exception:
-            self.failed.emit(traceback.format_exc())
+        except Exception as exc:
+            # Full traceback for anyone debugging from a real terminal;
+            # the GUI console only shows the short, human-readable message.
+            traceback.print_exc(file=sys.__stderr__)
+            self.failed.emit(str(exc) or exc.__class__.__name__)
         else:
             self.succeeded.emit(result)

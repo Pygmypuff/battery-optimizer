@@ -7,25 +7,28 @@ calculator.py and test_from_excel.py.
 
 `DEFAULTS` matches exactly what was previously hardcoded in those two
 files. The GUI's config window (gui/config_window.py) reads/writes
-`config.json` next to this file via `load_config()` / `save_config()` /
+config.json (see app_paths.config_dir() — an OS-managed per-user location,
+deliberately *not* next to this file, so it survives the whole app bundle
+being replaced on update) via `load_config()` / `save_config()` /
 `reset_config()`; calculator.py and test_from_excel.py call `load_config()`
 at the start of each run so a change saved from the GUI takes effect on the
 very next run, without needing to restart the app.
 
 Deliberately has no dependency on `calculator.py`, `nordpool`, or anything
-else heavy — `battery_optimizer.py` (stdlib + optional numpy/scipy) is the
-only import, so this stays cheap to import from either module.
+else heavy — `battery_optimizer.py` (stdlib + optional numpy/scipy) and
+`app_paths.py` (stdlib + platformdirs) are the only imports, so this stays
+cheap to import from either module.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from pathlib import Path
 
+from app_paths import config_dir
 from battery_optimizer import StationConfig
 
-CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+CONFIG_PATH = config_dir() / "config.json"
 
 DEFAULTS: dict[str, float] = {
     "max_charge_rate":        0.4,      # C   (MW)
