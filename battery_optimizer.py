@@ -11,45 +11,90 @@ Units
   Price     : EUR / MWh
   Revenue   : EUR
 
-Performance design
-------------------
-The DP state is kept to three dimensions to stay tractable:
+Algorithm design
+-----------------
+The schedule is solved as a mixed-integer program (MILP) via
+`scipy.optimize.milp` (HiGHS backend), which finds the mathematically
+maximum-profit schedule subject to every constraint below — not a
+heuristic approximation of it. If scipy isn't installed, or the solver
+can't return an optimal solution for some reason, this falls back to a
+greedy pairwise-matching heuristic (`_greedy_schedule`) that is still
+exactly constraint-correct, just not provably optimal.
 
-    (battery_level_idx, worst_block_price_idx, block_dir)
+Formulation (`_milp_schedule`)
+-------------------------------
+  1. Enumerate every candidate (source, sink) pair (i, j) with i
+     chronologically before j, where charging at i and discharging at j
+     would clear both the wear threshold (`price[j] - price[i] >= Y`) and
+     the discharge floor (`price[j] >= T`). Pre-existing battery charge
+     (StationState.battery_level) is one extra virtual source, priced at
+     `initial_charge_price`, available to pair with any j.
+  2. One continuous decision variable q_ij >= 0 per candidate pair — how
+     much energy (MWh) flows from source i to sink j.
+  3. One binary decision variable y_i per real slot — whether slot i acts
+     as a charge source (y_i=1) or a discharge sink (y_i=0) this run; this
+     is what makes it a MILP rather than a plain LP, since a slot
+     physically cannot be both in the same 15 minutes.
+  4. Maximise sum(q_ij * profit_per_mwh_ij) — see "Why profit-per-MWh"
+     below — subject to:
+       - source capacity   : sum_j q_ij <= max_charge_energy * y_i
+       - sink capacity     : sum_i q_ij <= max_discharge_energy * (1 - y_j)
+       - virtual source cap: sum_j q_(-1,j) <= initial battery_level
+       - 0 <= battery level at every slot boundary <= B (a linear running
+         sum of committed charges minus discharges up to that point)
+  Every constraint the user specified (C, S, P, B, Y, T) is therefore
+  modelled exactly, not approximated — the solver is free to use *any*
+  combination of pairs, in any order, that a feasible physical schedule
+  could realise, and proves it found the best one.
 
-  battery_level_idx   — index into a fixed grid of N_BATT evenly-spaced
-                        battery levels from 0 to battery_capacity.
-  worst_block_price_idx — index into the set of *distinct rounded prices*
-                          seen in the input.  Prices are rounded to the
-                          nearest PRICE_ROUND_EUR before indexing, which
-                          collapses near-identical prices and keeps this
-                          dimension small.  Typical size: 20–60 values.
-  block_dir           — 0=NONE, 1=CHARGE, 2=DISCHARGE.
+Why profit-per-MWh uses `price[j]*eff - price[i]` and not
+`price[j] - price[i]`
+---------------------------------------------------------------------------
+Charging or discharging a slot is always compared to the counterfactual of
+holding it instead (selling P directly). Working through the algebra:
+holding forgoes `price[i]` of revenue per MWh diverted into the battery at
+slot i (this holds regardless of whether i's overflow_power is 0), and
+discharging nets `price[j] * eff` of extra revenue per MWh drawn from the
+battery at slot j, because only `eff` of what's drawn actually reaches the
+grid (see `discharge_efficiency`). Y itself is still checked on the raw,
+unscaled price spread — that's the human-facing wear threshold the user
+defines it against — only the objective coefficients need the
+efficiency-adjusted figure.
 
-The scheduling budget (X-ratio constraint) is intentionally removed from the
-DP state.  The battery level already implicitly enforces it: you can only
-discharge energy that has actually been charged into the battery.  For the
-rare edge case where X >> 1 (very slow charging), the budget check is
-approximated by gating discharge on a minimum battery level threshold rather
-than a running counter, which is both faster and physically intuitive.
+Rate limits
+-----------
+  eff_charge_rate     = min(C, P)              — charging: all of P goes to
+                        the battery, capped by the battery's own max rate.
+  eff_discharge_rate  = min(C, max(0, S - P))  — discharging: the station's
+                        own power P is sold directly; the battery makes up
+                        the difference to reach the sell cap S, capped by
+                        the battery's own max discharge rate.
+  overflow_power      = max(0, P - C)          — power that can't physically
+                        fit into the battery even while charging; sold
+                        immediately at the spot price.
 
-The DP is solved bottom-up (from the last slot backwards) using a 3-D numpy
-value array, avoiding Python recursion and lru_cache overhead entirely.
+The charge:discharge ratio X described by the user (how many charge slots
+are needed, at the current P, to fill the battery relative to how many
+discharge slots are needed to empty it) is not tracked as a separate
+scheduling budget — it falls out naturally from the source/sink capacities
+above. `compute_charge_discharge_ratio` is kept as a standalone,
+informational figure (e.g. for logging/reporting), matching how it was
+used before.
 
-Y-constraint design
--------------------
-Enforced at every block transition via worst_block_price:
-  • CHARGE block  → tracks the HIGHEST charge price seen (worst case for
-                    future discharge profitability).
-  • DISCHARGE block → tracks the LOWEST discharge price seen (worst case
-                      for future charge profitability).
-At a transition, the new action's price must clear Y against worst_block_price.
-HOLD leaves the block state unchanged.
+Performance
+-----------
+O(N^2) candidate pairs (continuous variables) plus N binary variables and
+O(N) boundary constraints. HiGHS solves this in well under a second for a
+day of 15-minute slots (N ~ 100-150). If this is ever run over a much
+longer horizon, the pair set should be pruned or the boundary constraints
+should move to an incremental/sparse formulation (already sparse here, but
+the O(N^2) pair count is the part that would need attention first).
 
 Pre-existing battery charge
----------------------------
+----------------------------
 If battery_level > 0 at the start of a run, StationState.initial_charge_price
-seeds worst_block_price so early discharges are evaluated correctly.
+prices a virtual source slot (see step 1 above) so early discharges are
+evaluated against it correctly.
 
 Public API
 ----------
@@ -63,39 +108,17 @@ Public API
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-import numpy as np
-
-
-# ---------------------------------------------------------------------------
-# Tunable resolution constants
-# ---------------------------------------------------------------------------
-
-N_BATT: int          = 100    # number of battery level grid points (0..B)
-                               # 100 → steps of B/100 MWh each
-PRICE_ROUND_EUR: float = 1.0  # Controls resolution of worst_block_price in
-                               # the DP state ONLY — never applied to slot prices
-                               # used in revenue calculations (those stay full float).
-                               #
-                               # Rounding by R EUR introduces at most R EUR error
-                               # in Y-spread comparisons — negligible when R << Y.
-                               # Example: Y=20, R=1.0 → max 5% spread error.
-                               #
-                               # Performance vs accuracy trade-off:
-                               #   R=1.0 → ~130 price keys, ~95ms for 140 slots
-                               #   R=0.5 → ~260 keys,  ~2× slower
-                               #   R=0.1 → ~1300 keys, ~10× slower
-                               #   R=0.01 → ~13000 keys, ~100× slower (~10s)
-                               #
-                               # Rule of thumb: keep R >= Y / 20.
-
-# Block direction ordinals (stored as uint8 in numpy arrays)
-_DIR_NONE      = 0
-_DIR_CHARGE    = 1
-_DIR_DISCHARGE = 2
+try:
+    import numpy as np
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    _HAS_MILP = True
+except ImportError:
+    _HAS_MILP = False
 
 
 # ---------------------------------------------------------------------------
@@ -118,9 +141,10 @@ class StationConfig:
     max_charge_rate      : C – maximum battery charge/discharge rate (MW).
     max_sell_rate        : S – hard cap on power sold to the grid (MW).
     battery_capacity     : B – total usable battery storage (MWh).
-    min_price_delta      : Y – minimum price spread (EUR/MWh) required at
-                           every charge↔discharge block transition, measured
-                           against the worst price in the opposing block.
+    min_price_delta      : Y – minimum price spread (EUR/MWh) required
+                           between the price a unit of energy was charged at
+                           and the price it is later discharged at, for that
+                           trade to be worth the battery wear.
     min_discharge_price  : T – absolute discharge floor (EUR/MWh).
     discharge_loss_pct   : energy lost during discharge (0–100 %).
     """
@@ -154,7 +178,7 @@ class StationState:
                            value carried into a rerun.
     initial_charge_price : effective average price (EUR/MWh) at which the
                            energy currently in the battery was charged.
-                           Used to seed the Y-constraint block tracker.
+                           Seeds the cost-basis ledger for early discharges.
                            Pass 0.0 if unknown (most permissive default).
     """
     station_power:        float
@@ -207,7 +231,328 @@ def compute_charge_discharge_ratio(
 
 
 # ---------------------------------------------------------------------------
-# Bottom-up DP
+# Shared setup / finalisation
+# ---------------------------------------------------------------------------
+
+_EPS = 1e-9
+
+
+def _rates(cfg: StationConfig, state: StationState, t: float) -> tuple[float, float, float]:
+    """Returns (max_charge_energy, max_discharge_energy, overflow_power) for one slot."""
+    C, S, P = cfg.max_charge_rate, cfg.max_sell_rate, state.station_power
+    eff_charge_rate    = min(C, P)
+    eff_discharge_rate = min(C, max(0.0, S - P))
+    overflow_power     = max(0.0, P - C)
+    return eff_charge_rate * t, eff_discharge_rate * t, overflow_power
+
+
+def _build_candidate_pairs(
+    prices: list[float],
+    cfg:    StationConfig,
+    state:  StationState,
+    max_charge_energy:    float,
+    max_discharge_energy: float,
+    initial_level: float,
+) -> list[tuple[int, int, float]]:
+    """
+    Every (source, sink, profit_per_mwh) triple that clears Y and T.
+    source == -1 is the pre-existing battery charge (see module docstring).
+    """
+    num_slots = len(prices)
+    eff = cfg.discharge_efficiency
+    Y   = cfg.min_price_delta
+    T   = cfg.min_discharge_price
+    initial_price = state.initial_charge_price
+
+    pairs: list[tuple[int, int, float]] = []
+    if max_discharge_energy <= _EPS:
+        return pairs
+
+    if initial_level > _EPS:
+        for j in range(num_slots):
+            pj = prices[j]
+            if pj - initial_price >= Y and pj >= T:
+                pairs.append((-1, j, pj * eff - initial_price))
+
+    if max_charge_energy > _EPS:
+        for i in range(num_slots - 1):
+            pi = prices[i]
+            for j in range(i + 1, num_slots):
+                pj = prices[j]
+                if pj - pi >= Y and pj >= T:
+                    pairs.append((i, j, pj * eff - pi))
+
+    return pairs
+
+
+def _finalize_schedule(
+    prices:             list[float],
+    cfg:                StationConfig,
+    state:              StationState,
+    start_slot:         int,
+    energy_charged:     list[float],
+    energy_discharged:  list[float],
+    overflow_power:     float,
+) -> OptimisationResult:
+    """Turns per-slot charge/discharge amounts into the public result type."""
+    num_slots = len(prices)
+    t   = 0.25
+    eff = cfg.discharge_efficiency
+    S   = cfg.max_sell_rate
+    P   = state.station_power
+
+    schedule: list[SlotResult] = []
+    total_revenue = 0.0
+    battery_level = min(max(state.battery_level, 0.0), cfg.battery_capacity)
+
+    for slot in range(num_slots):
+        price = prices[slot]
+        ec = energy_charged[slot]
+        ed = energy_discharged[slot]
+
+        if ec > _EPS:
+            action = BatteryAction.CHARGE
+            battery_level += ec
+            power_sold = overflow_power
+            revenue    = price * overflow_power * t
+        elif ed > _EPS:
+            action = BatteryAction.DISCHARGE
+            battery_level -= ed
+            energy_delivered = ed * eff
+            power_sold       = min(S, P + energy_delivered / t)
+            revenue          = price * power_sold * t
+        else:
+            action = BatteryAction.HOLD
+            power_sold = P
+            revenue    = price * P * t
+
+        total_revenue += revenue
+
+        schedule.append(SlotResult(
+            slot_index        = start_slot + slot,
+            action            = action,
+            energy_charged    = ec,
+            energy_discharged = ed,
+            power_sold        = power_sold,
+            revenue           = revenue,
+            battery_level_end = battery_level,
+        ))
+
+    return OptimisationResult(
+        schedule        = schedule,
+        total_revenue   = total_revenue,
+        slots_optimised = num_slots,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Greedy pairwise-matching fallback (used when scipy/HiGHS isn't available,
+# or the solver can't return an optimal result)
+# ---------------------------------------------------------------------------
+
+def _greedy_schedule(
+    prices:     list[float],
+    cfg:        StationConfig,
+    state:      StationState,
+    start_slot: int,
+    max_charge_energy:    float,
+    max_discharge_energy: float,
+    overflow_power:       float,
+) -> OptimisationResult:
+    num_slots = len(prices)
+    B = cfg.battery_capacity
+    initial_level = min(max(state.battery_level, 0.0), B)
+
+    pairs = _build_candidate_pairs(
+        prices, cfg, state, max_charge_energy, max_discharge_energy, initial_level
+    )
+    pairs.sort(key=lambda c: -c[2])
+
+    remaining_charge    = [max_charge_energy] * num_slots
+    remaining_discharge = [max_discharge_energy] * num_slots
+    remaining_initial    = initial_level
+    slot_role: list[Optional[str]] = [None] * num_slots  # 'charge' | 'discharge'
+
+    # level[k] = battery level at the boundary *before* slot k's action.
+    # Starts flat at initial_level; charge/discharge pairs are range updates.
+    level = [initial_level] * (num_slots + 1)
+
+    energy_charged    = [0.0] * num_slots
+    energy_discharged = [0.0] * num_slots
+
+    for i, j, _ in pairs:
+        if slot_role[j] == 'charge':
+            continue
+        if i == -1:
+            src_cap = remaining_initial
+        else:
+            if slot_role[i] == 'discharge':
+                continue
+            src_cap = remaining_charge[i]
+        if src_cap <= _EPS or remaining_discharge[j] <= _EPS:
+            continue
+
+        if i == -1:
+            # Consuming pre-existing charge only ever removes energy from
+            # slot j+1 onward (it's already reflected in the flat baseline).
+            room = min(level[k] for k in range(j + 1, num_slots + 1))
+        else:
+            # A same-pair charge-then-discharge nets to zero after j, so the
+            # only range that matters is the open interval (i, j].
+            room = B - max(level[k] for k in range(i + 1, j + 1))
+
+        q = min(src_cap, remaining_discharge[j], room)
+        if q <= _EPS:
+            continue
+
+        if i == -1:
+            remaining_initial -= q
+            for k in range(j + 1, num_slots + 1):
+                level[k] -= q
+        else:
+            remaining_charge[i] -= q
+            energy_charged[i] += q
+            slot_role[i] = 'charge'
+            for k in range(i + 1, j + 1):
+                level[k] += q
+
+        remaining_discharge[j] -= q
+        energy_discharged[j] += q
+        slot_role[j] = 'discharge'
+
+    return _finalize_schedule(
+        prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power
+    )
+
+
+# ---------------------------------------------------------------------------
+# Exact MILP scheduler
+# ---------------------------------------------------------------------------
+
+def _milp_schedule(
+    prices:     list[float],
+    cfg:        StationConfig,
+    state:      StationState,
+    start_slot: int,
+    max_charge_energy:    float,
+    max_discharge_energy: float,
+    overflow_power:       float,
+) -> Optional[OptimisationResult]:
+    """Returns None if the solver doesn't return an optimal solution."""
+    num_slots = len(prices)
+    B = cfg.battery_capacity
+    initial_level = min(max(state.battery_level, 0.0), B)
+
+    pairs = _build_candidate_pairs(
+        prices, cfg, state, max_charge_energy, max_discharge_energy, initial_level
+    )
+    n_pairs = len(pairs)
+
+    energy_charged    = [0.0] * num_slots
+    energy_discharged = [0.0] * num_slots
+    if n_pairs == 0:
+        return _finalize_schedule(
+            prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power
+        )
+
+    n_vars = n_pairs + num_slots  # [q_0..q_{P-1}, y_0..y_{N-1}]
+
+    pairs_by_source: dict[int, list[int]] = {}
+    pairs_by_sink:   dict[int, list[int]] = {}
+    for k, (i, j, _profit) in enumerate(pairs):
+        pairs_by_source.setdefault(i, []).append(k)
+        pairs_by_sink.setdefault(j, []).append(k)
+
+    objective = np.zeros(n_vars)
+    for k, (_i, _j, profit) in enumerate(pairs):
+        objective[k] = -profit  # milp minimises, so negate to maximise profit
+
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    lb: list[float] = []
+    ub: list[float] = []
+    row_idx = 0
+
+    def add_row(col_coef: dict[int, float], row_lb: float, row_ub: float) -> None:
+        nonlocal row_idx
+        for col, coef in col_coef.items():
+            rows.append(row_idx)
+            cols.append(col)
+            data.append(coef)
+        lb.append(row_lb)
+        ub.append(row_ub)
+        row_idx += 1
+
+    for i in range(num_slots):
+        y_col = n_pairs + i
+        src = pairs_by_source.get(i)
+        if src:
+            add_row({**{k: 1.0 for k in src}, y_col: -max_charge_energy}, -math.inf, 0.0)
+        snk = pairs_by_sink.get(i)
+        if snk:
+            add_row({**{k: 1.0 for k in snk}, y_col: max_discharge_energy},
+                    -math.inf, max_discharge_energy)
+
+    if -1 in pairs_by_source:
+        add_row({k: 1.0 for k in pairs_by_source[-1]}, -math.inf, initial_level)
+
+    # Battery level at every boundary m=1..N, expressed relative to
+    # initial_level: charge_before_m - discharge_before_m in [-initial_level,
+    # B - initial_level]. Built incrementally so this stays O(pairs + N)
+    # instead of O(pairs * N).
+    active: dict[int, float] = {}
+    for m in range(1, num_slots + 1):
+        for k in pairs_by_source.get(m - 1, []):
+            active[k] = active.get(k, 0.0) + 1.0
+        for k in pairs_by_sink.get(m - 1, []):
+            active[k] = active.get(k, 0.0) - 1.0
+        if active:
+            add_row(dict(active), -initial_level, B - initial_level)
+
+    if not rows:
+        return _finalize_schedule(
+            prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power
+        )
+
+    from scipy.sparse import coo_matrix
+    A = coo_matrix((data, (rows, cols)), shape=(row_idx, n_vars))
+    constraint = LinearConstraint(A, lb=lb, ub=ub)
+
+    var_lb = np.zeros(n_vars)
+    var_ub = np.full(n_vars, np.inf)
+    var_ub[:n_pairs] = [max_charge_energy if i != -1 else initial_level for i, _j, _p in pairs]
+    var_ub[n_pairs:] = 1.0
+    integrality = np.zeros(n_vars)
+    integrality[n_pairs:] = 1.0
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        res = milp(
+            objective,
+            constraints=[constraint],
+            integrality=integrality,
+            bounds=Bounds(var_lb, var_ub),
+        )
+
+    if not res.success:
+        return None
+
+    for k, (i, j, _profit) in enumerate(pairs):
+        q = res.x[k]
+        if q <= _EPS:
+            continue
+        if i != -1:
+            energy_charged[i] += q
+        energy_discharged[j] += q
+
+    return _finalize_schedule(
+        prices, cfg, state, start_slot, energy_charged, energy_discharged, overflow_power
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
 # ---------------------------------------------------------------------------
 
 def optimise_battery_schedule(
@@ -217,308 +562,44 @@ def optimise_battery_schedule(
     start_slot: int = 0,
 ) -> OptimisationResult:
     """
-    Solve the battery scheduling problem with a bottom-up DP over:
+    Schedule CHARGE/DISCHARGE/HOLD for every slot in `prices` to maximise
+    total revenue, subject to rate limits (C, P), the sell cap (S), battery
+    capacity (B), the wear threshold (Y, checked per matched pair) and the
+    discharge floor (T).
 
-        state = (battery_level_idx, worst_block_price_idx, block_dir)
-
-    The value table V[b, w, d] = best revenue achievable from the current
-    slot onwards when the battery is at grid level b, the worst block price
-    index is w, and the current block direction is d.
-
-    Complexity: O(N_slots × N_BATT × N_prices × 3 × 3_actions)
-    Typical wall time for 140 slots: < 1 second.
+    Solved exactly via MILP when scipy is available (see module docstring);
+    falls back to a constraint-correct greedy heuristic otherwise.
     """
     num_slots = len(prices)
     if num_slots == 0:
         return OptimisationResult(schedule=[], total_revenue=0.0, slots_optimised=0)
 
-    t   = 0.25
-    eff = cfg.discharge_efficiency
-    Y   = cfg.min_price_delta
-    T   = cfg.min_discharge_price
-    B   = cfg.battery_capacity
-    C   = cfg.max_charge_rate
-    S   = cfg.max_sell_rate
-    P   = state.station_power
+    t = 0.25
+    max_charge_energy, max_discharge_energy, overflow_power = _rates(cfg, state, t)
 
-    eff_charge_rate    = min(C, P)
-    eff_discharge_rate = max(0.0, S - P)
-    overflow_power     = max(0.0, P - C)
-
-    # --- Battery level grid ---
-    batt_grid = np.linspace(0.0, B, N_BATT + 1)   # N_BATT+1 points
-    n_batt    = len(batt_grid)
-    batt_step = B / N_BATT
-
-    def batt_to_idx(level: float) -> int:
-        return int(round(level / batt_step))
-
-    # --- Worst-block-price grid ---
-    # Collect all distinct rounded prices that can appear as worst_block_price,
-    # including the initial_charge_price.
-    def round_price(p: float) -> float:
-        return round(p / PRICE_ROUND_EUR) * PRICE_ROUND_EUR
-
-    candidate_prices = set()
-    for p in prices:
-        candidate_prices.add(round_price(p))
-    candidate_prices.add(round_price(state.initial_charge_price))
-    candidate_prices.add(0.0)   # sentinel for DIR_NONE
-
-    price_list  = sorted(candidate_prices)
-    n_prices    = len(price_list)
-    price_to_wi = {p: i for i, p in enumerate(price_list)}
-
-    def price_wi(p: float) -> int:
-        rp = round_price(p)
-        if rp in price_to_wi:
-            return price_to_wi[rp]
-        # Snap to nearest if rounding produces a value not in the set
-        # (can happen at float boundary; find nearest)
-        nearest = min(price_list, key=lambda x: abs(x - rp))
-        return price_to_wi[nearest]
-
-    # --- Value and policy tables ---
-    # V[b, w, d]      = best future revenue (float)
-    # policy[t, b, w, d] = action index (0=HOLD, 1=CHARGE, 2=DISCHARGE)
-    V      = np.zeros((n_batt, n_prices, 3), dtype=np.float64)
-    policy = np.zeros((num_slots, n_batt, n_prices, 3), dtype=np.int8)
-
-    ACT_HOLD      = 0
-    ACT_CHARGE    = 1
-    ACT_DISCHARGE = 2
-
-    # --- Pre-compute transition tables (done once, not per slot) -----------
-    #
-    # For each (battery_idx, worst_price_idx, block_dir) state, and each
-    # action, we pre-compute:
-    #   - whether the action is physically/economically feasible (ignoring the
-    #     per-slot price checks that depend on the current slot's price)
-    #   - the next state indices (new_bi, new_wi, new_d)
-    #   - the slot-independent part of the revenue (factors not involving price)
-    #
-    # Per-slot checks (Y spread, T floor) are applied cheaply inside the loop.
-
-    # Battery level arrays shaped (n_batt,)
-    batt_arr      = batt_grid                          # shape (n_batt,)
-    headroom_arr  = B - batt_arr                       # space left to charge
-    energy_in_arr = np.minimum(eff_charge_rate * t, headroom_arr)
-    can_charge    = energy_in_arr > 1e-9               # bool (n_batt,)
-
-    energy_drawn_arr = np.minimum(eff_discharge_rate * t, batt_arr)
-    can_discharge    = energy_drawn_arr > 1e-9         # bool (n_batt,)
-
-    # New battery indices after charge / discharge
-    new_bi_charge    = np.clip(np.round((batt_arr + energy_in_arr)   / batt_step).astype(int), 0, N_BATT)
-    new_bi_discharge = np.clip(np.round((batt_arr - energy_drawn_arr) / batt_step).astype(int), 0, N_BATT)
-
-    # Revenue scalars (price-independent parts)
-    charge_rev_per_price    = overflow_power * t        # multiply by price each slot
-    hold_rev_per_price      = P * t
-    energy_del_arr          = energy_drawn_arr * eff
-    sold_power_arr          = np.minimum(S, P + energy_del_arr / t)
-    discharge_rev_per_price = sold_power_arr * t        # shape (n_batt,); multiply by price
-
-    # Worst-price index transitions for CHARGE and DISCHARGE actions.
-    # Shape: (n_prices,) — for each current worst_price_idx, what is the new
-    # worst_price_idx when continuing or starting a block at the slot price rp.
-    # These are precomputed per slot inside the main loop (they depend on rp).
-
-    # --- Bottom-up fill (last slot → first slot) ---
-    for slot in range(num_slots - 1, -1, -1):
-        price = prices[slot]
-        rp    = round_price(price)
-        rp_wi = price_wi(rp)
-
-        # Price array for per-wi Y-spread checks (shape n_prices)
-        wp_arr = np.array(price_list, dtype=np.float64)
-
-        # ── worst-price index after this slot's action ──────────────────
-        # CHARGE continuing: new_wp = max(wp, rp)
-        new_wi_charge_cont = np.array(
-            [price_wi(max(wp, rp)) for wp in price_list], dtype=np.int32
+    if _HAS_MILP:
+        result = _milp_schedule(
+            prices, cfg, state, start_slot,
+            max_charge_energy, max_discharge_energy, overflow_power,
         )
-        # CHARGE starting new block: new_wp = rp regardless of old wp
-        new_wi_charge_new  = rp_wi   # scalar — same for all wi
-
-        # DISCHARGE continuing: new_wp = min(wp, rp)
-        new_wi_dis_cont    = np.array(
-            [price_wi(min(wp, rp)) for wp in price_list], dtype=np.int32
+        if result is not None:
+            return result
+        warnings.warn(
+            "MILP solver did not return an optimal solution; "
+            "falling back to the greedy heuristic scheduler.",
+            RuntimeWarning,
         )
-        # DISCHARGE starting new block: new_wp = rp
-        new_wi_dis_new     = rp_wi
-
-        # ── revenue this slot ────────────────────────────────────────────
-        hold_rev       = price * hold_rev_per_price            # scalar
-        charge_rev     = price * charge_rev_per_price          # scalar
-        dis_rev_arr    = price * discharge_rev_per_price       # shape (n_batt,)
-
-        # ── future value shortcuts ───────────────────────────────────────
-        # V has already been updated for slot+1 (or is 0 for last slot).
-        # Shape reminders: V is (n_batt, n_prices, 3)
-
-        V_new   = np.full((n_batt, n_prices, 3), -np.inf, dtype=np.float64)
-        pol_new = np.zeros((n_batt, n_prices, 3), dtype=np.int8)
-
-        # We iterate over block direction d (only 3 values) and vectorise
-        # over all (bi, wi) pairs simultaneously using numpy broadcasting.
-
-        for d in range(3):
-            # ── HOLD ──────────────────────────────────────────────────
-            # future V[bi, wi, d] — same state, next slot
-            fut_hold = V[:, :, d]                  # (n_batt, n_prices)
-            val_hold = hold_rev + fut_hold          # broadcast scalar
-
-            best     = val_hold.copy()
-            best_act = np.zeros((n_batt, n_prices), dtype=np.int8)  # ACT_HOLD=0
-
-            # ── CHARGE ────────────────────────────────────────────────
-            # Y check: only blocked when coming from a DISCHARGE block
-            if d == _DIR_DISCHARGE:
-                # charge allowed only where wp - price >= Y  (per wi)
-                charge_y_ok = (wp_arr - price) >= Y   # shape (n_prices,)
-            else:
-                charge_y_ok = np.ones(n_prices, dtype=bool)
-
-            # New worst-price index depends on whether we continue or start
-            if d == _DIR_CHARGE:
-                nwi_charge = new_wi_charge_cont    # shape (n_prices,)
-            else:
-                nwi_charge = np.full(n_prices, new_wi_charge_new, dtype=np.int32)
-
-            # For each bi: can_charge[bi] and new_bi_charge[bi] are fixed.
-            # For each wi: charge_y_ok[wi] and nwi_charge[wi] are fixed.
-            # Revenue is scalar charge_rev; future is V[new_bi_charge[bi], nwi_charge[wi], CHARGE].
-
-            # Build future value matrix (n_batt, n_prices) for charge action
-            # fut_charge[bi, wi] = V[new_bi_charge[bi], nwi_charge[wi], _DIR_CHARGE]
-            fut_charge = V[new_bi_charge[:, None], nwi_charge[None, :], _DIR_CHARGE]
-            # (n_batt, n_prices)
-
-            val_charge = charge_rev + fut_charge   # (n_batt, n_prices)
-
-            # Mask out infeasible charge states
-            feasible_charge = (
-                can_charge[:, None]          # battery not full (n_batt, 1)
-                & charge_y_ok[None, :]       # Y spread ok     (1, n_prices)
-            )
-            val_charge = np.where(feasible_charge, val_charge, -np.inf)
-
-            better = val_charge > best
-            best     = np.where(better, val_charge, best)
-            best_act = np.where(better, ACT_CHARGE, best_act)
-
-            # ── DISCHARGE ─────────────────────────────────────────────
-            # T floor check (scalar, same for all states)
-            if price < T:
-                dis_y_ok = np.zeros(n_prices, dtype=bool)  # all blocked
-            elif d == _DIR_CHARGE or d == _DIR_NONE:
-                # Y check: price - wp >= Y  per wi
-                dis_y_ok = (price - wp_arr) >= Y
-            else:
-                # Continuing discharge block — no Y check at transition
-                dis_y_ok = np.ones(n_prices, dtype=bool)
-
-            if d == _DIR_DISCHARGE:
-                nwi_dis = new_wi_dis_cont
-            else:
-                nwi_dis = np.full(n_prices, new_wi_dis_new, dtype=np.int32)
-
-            # fut_discharge[bi, wi] = V[new_bi_discharge[bi], nwi_dis[wi], _DIR_DISCHARGE]
-            fut_discharge = V[new_bi_discharge[:, None], nwi_dis[None, :], _DIR_DISCHARGE]
-
-            # dis_rev_arr is (n_batt,); broadcast to (n_batt, n_prices)
-            val_discharge = dis_rev_arr[:, None] + fut_discharge
-
-            feasible_discharge = (
-                can_discharge[:, None]
-                & dis_y_ok[None, :]
-            )
-            val_discharge = np.where(feasible_discharge, val_discharge, -np.inf)
-
-            better = val_discharge > best
-            best     = np.where(better, val_discharge, best)
-            best_act = np.where(better, ACT_DISCHARGE, best_act)
-
-            V_new[:, :, d]   = best
-            pol_new[:, :, d] = best_act
-
-        V = V_new
-        policy[slot] = pol_new
-
-    # --- Determine initial state ---
-    if state.battery_level > 1e-6:
-        init_dir = _DIR_CHARGE
-        init_wp  = round_price(state.initial_charge_price)
     else:
-        init_dir = _DIR_NONE
-        init_wp  = 0.0
+        warnings.warn(
+            "scipy is not installed; using the greedy heuristic scheduler "
+            "instead of the exact MILP solver. Install scipy for a "
+            "mathematically guaranteed maximum-profit schedule.",
+            RuntimeWarning,
+        )
 
-    init_bi = batt_to_idx(min(state.battery_level, B))
-    init_wi = price_wi(init_wp)
-
-    total_revenue = float(V[init_bi, init_wi, init_dir])
-
-    # --- Reconstruct schedule forward ---
-    schedule: list[SlotResult] = []
-    bi = init_bi
-    wi = init_wi
-    d  = init_dir
-
-    for slot in range(num_slots):
-        act_idx = int(policy[slot, bi, wi, d])
-        price   = prices[slot]
-        rp      = round_price(price)
-        batt    = batt_grid[bi]
-
-        if act_idx == ACT_HOLD:
-            action            = BatteryAction.HOLD
-            energy_charged    = 0.0
-            energy_discharged = 0.0
-            power_sold        = P
-            revenue           = price * P * t
-            new_bi, new_wi, new_d = bi, wi, d
-
-        elif act_idx == ACT_CHARGE:
-            action         = BatteryAction.CHARGE
-            headroom       = B - batt
-            energy_charged = min(eff_charge_rate * t, headroom)
-            energy_discharged = 0.0
-            power_sold     = overflow_power
-            revenue        = price * overflow_power * t
-            new_bi         = batt_to_idx(batt + energy_charged)
-            new_wp         = max(round_price(price_list[wi]), rp) if d == _DIR_CHARGE else rp
-            new_wi         = price_wi(new_wp)
-            new_d          = _DIR_CHARGE
-
-        else:  # ACT_DISCHARGE
-            action            = BatteryAction.DISCHARGE
-            energy_discharged = min(eff_discharge_rate * t, batt)
-            energy_charged    = 0.0
-            energy_del        = energy_discharged * eff
-            power_sold        = min(S, P + energy_del / t)
-            revenue           = price * power_sold * t
-            new_bi            = batt_to_idx(batt - energy_discharged)
-            new_wp            = min(round_price(price_list[wi]), rp) if d == _DIR_DISCHARGE else rp
-            new_wi            = price_wi(new_wp)
-            new_d             = _DIR_DISCHARGE
-
-        schedule.append(SlotResult(
-            slot_index        = start_slot + slot,
-            action            = action,
-            energy_charged    = energy_charged,
-            energy_discharged = energy_discharged,
-            power_sold        = power_sold,
-            revenue           = revenue,
-            battery_level_end = batt_grid[new_bi],
-        ))
-
-        bi, wi, d = new_bi, new_wi, new_d
-
-    return OptimisationResult(
-        schedule        = schedule,
-        total_revenue   = total_revenue,
-        slots_optimised = num_slots,
+    return _greedy_schedule(
+        prices, cfg, state, start_slot,
+        max_charge_energy, max_discharge_energy, overflow_power,
     )
 
 
