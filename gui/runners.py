@@ -12,12 +12,13 @@ from pathlib import Path
 
 import calculator
 import test_from_excel
-from app_paths import output_dir
+from app_paths import bundle_dir, output_dir
 from station_config import load_config
 
-# Bundled, read-only resource (ships with the app, updates with it) — kept
-# relative to the app's own install location, unlike OUTPUT_DIR below.
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+# Bundled, read-only resource (ships with the app, updates with it). Uses
+# bundle_dir() rather than raw __file__ so this still resolves correctly
+# once frozen by PyInstaller — see app_paths.py.
+PROJECT_DIR = bundle_dir()
 
 # Generated output workbooks. Deliberately NOT relative to PROJECT_DIR:
 # once packaged, that's inside the app bundle, and replacing the whole

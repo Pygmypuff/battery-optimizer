@@ -1,0 +1,79 @@
+name: Build macOS App
+
+# PyInstaller can't cross-compile — this has to actually run on macOS, which
+# is why this is a GitHub Actions workflow rather than something built
+# locally. Push a tag like "v0.2.0" to build + attach a .dmg to a new
+# GitHub Release; use "Run workflow" in the Actions tab any other time to
+# get a build without publishing anything (uploaded as a workflow artifact
+# instead, downloadable from the run's summary page).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # to create a Release and upload the .dmg to it
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build .app bundle
+        run: pyinstaller BatteryOptimizer.spec --noconfirm
+
+      - name: Self-test the build
+        # Catches exactly the kind of thing that's easy to get wrong when
+        # packaging (a dependency's import silently failing, a bundled
+        # data file not actually being where the app looks for it) before
+        # it ever reaches a release. See app.py's --selftest handling.
+        run: ./dist/BatteryOptimizer.app/Contents/MacOS/BatteryOptimizer --selftest
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Package as .dmg
+        run: |
+          create-dmg \
+            --volname "Battery Optimizer" \
+            --window-size 660 400 \
+            --icon-size 100 \
+            --icon "BatteryOptimizer.app" 180 170 \
+            --app-drop-link 480 170 \
+            "dist/BatteryOptimizer-${{ github.ref_name }}.dmg" \
+            "dist/BatteryOptimizer.app" || true
+          # create-dmg is known to sometimes exit non-zero even after
+          # successfully producing the .dmg (a long-standing quirk of the
+          # Finder AppleScript it drives under the hood) — so check the
+          # actual output file rather than trusting the exit code alone.
+          test -f "dist/BatteryOptimizer-${{ github.ref_name }}.dmg"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BatteryOptimizer-macOS
+          path: dist/BatteryOptimizer-*.dmg
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/BatteryOptimizer-*.dmg
+          generate_release_notes: true

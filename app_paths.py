@@ -19,10 +19,20 @@ config and output history along with the old bundle.
                  user's Documents folder rather than the hidden config
                  dir, since these are files people browse/open/share:
                    <Documents>/BatteryOptimizer Output
+
+  bundle_dir() — the OPPOSITE kind of path: where the app's own bundled,
+                 READ-ONLY resources live (currently just excel_template.
+                 xlsx). Running from source, that's this file's own
+                 directory. Once frozen by PyInstaller, `__file__` no
+                 longer points anywhere real (frozen modules are loaded out
+                 of an in-memory archive), so bundled data files have to be
+                 found via `sys._MEIPASS` instead — set by PyInstaller's
+                 bootloader for both --onefile and --onedir/.app builds.
 """
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from platformdirs import PlatformDirs
@@ -41,3 +51,10 @@ def output_dir() -> Path:
     path = Path(_dirs.user_documents_dir) / f"{_APP_NAME} Output"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def bundle_dir() -> Path:
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass is not None:
+        return Path(meipass)
+    return Path(__file__).resolve().parent

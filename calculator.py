@@ -21,7 +21,7 @@ import re
 import zipfile
 
 
-from app_paths import output_dir as default_output_dir
+from app_paths import bundle_dir, output_dir as default_output_dir
 from battery_optimizer import (
     BatteryAction,
     StationConfig,
@@ -49,7 +49,10 @@ bottom_unusable_pct = _DEFAULT_APP_CFG.bottom_unusable_pct
 top_unusable_pct = 5 # 5% of battery capacity is unusable (top) — not currently used below
 red_line_threshold = _DEFAULT_APP_CFG.red_line_threshold
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Where excel_template.xlsx (a bundled, read-only resource) lives. Uses
+# bundle_dir() rather than raw __file__ so this still resolves correctly
+# once frozen by PyInstaller — see app_paths.py.
+SCRIPT_DIR = str(bundle_dir())
 
 # --- Domain types ---
 
