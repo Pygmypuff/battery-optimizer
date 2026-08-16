@@ -7,3 +7,4 @@
 # `pyinstaller BatteryOptimizer.spec`, not meant to be committed.
 /build/
 /dist/
+/__pycache__/
