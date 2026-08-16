@@ -54,6 +54,15 @@ jobs:
           iconutil -c icns icon.iconset -o assets/icon.icns
           rm -rf icon.iconset
 
+      - name: Stamp version from tag
+        # Only for a real tag push (not "Run workflow", which has no tag)
+        # so version.py's "0.0.0-dev" default is left alone for ad-hoc
+        # builds — see version.py and gui/update_check.py for why that
+        # default matters (it's what suppresses the update-check banner
+        # for anyone running from source).
+        if: startsWith(github.ref, 'refs/tags/')
+        run: sed -i '' "s/__version__ = \".*\"/__version__ = \"${{ github.ref_name }}\"/" version.py
+
       - name: Build .app bundle
         run: pyinstaller BatteryOptimizer.spec --noconfirm
 

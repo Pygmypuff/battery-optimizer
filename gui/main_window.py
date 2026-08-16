@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 
 from gui.config_window import ConfigDialog
 from gui.runners import run_nordpool_from_now_mode, run_nordpool_mode, run_test_mode
+from gui.update_check import UpdateCheckWorker
 from gui.worker import RunWorker
 
 
@@ -164,6 +165,14 @@ class MainWindow(QMainWindow):
 
         self._worker: Optional[RunWorker] = None
         self._last_output_path: Optional[Path] = None
+        self._update_checker: Optional[UpdateCheckWorker] = None
+
+        self.update_banner = QLabel()
+        self.update_banner.setOpenExternalLinks(True)
+        self.update_banner.setStyleSheet(
+            "background-color: #2d4a2d; color: #d4ffd4; padding: 6px; border-radius: 4px;"
+        )
+        self.update_banner.hide()
 
         self.live_tab = LiveRunTab(self.start_run)
         self.test_tab = TestModeTab(self.start_run)
@@ -196,11 +205,29 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         layout = QVBoxLayout(central)
+        layout.addWidget(self.update_banner)
         layout.addWidget(self.tabs)
         layout.addWidget(QLabel("Progress:"))
         layout.addWidget(self.console, stretch=1)
         layout.addLayout(bottom_row)
         self.setCentralWidget(central)
+
+        self._check_for_updates()
+
+    def _check_for_updates(self) -> None:
+        # Runs in the background and simply never emits anything if GitHub
+        # can't be reached — see gui/update_check.py. Must never delay or
+        # block showing the window, since this app needs to work offline.
+        self._update_checker = UpdateCheckWorker()
+        self._update_checker.update_available.connect(self._show_update_banner)
+        self._update_checker.start()
+
+    def _show_update_banner(self, tag_name: str, html_url: str) -> None:
+        self.update_banner.setText(
+            f'A new version ({tag_name}) is available — '
+            f'<a href="{html_url}">download it from GitHub</a>.'
+        )
+        self.update_banner.show()
 
     def start_run(self, target: Callable[..., Any], *args: Any) -> None:
         if self._worker is not None and self._worker.isRunning():

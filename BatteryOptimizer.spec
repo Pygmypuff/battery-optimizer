@@ -24,6 +24,7 @@ just won't have a custom .app icon, which is fine — BUNDLE() is skipped
 outside macOS anyway.
 """
 
+import re
 from pathlib import Path
 
 from PyInstaller.utils.hooks import copy_metadata
@@ -33,6 +34,13 @@ from PyInstaller.utils.hooks import copy_metadata
 # skipped that step, rather than erroring.
 _icns_path = Path("assets/icon.icns")
 macos_icon = str(_icns_path) if _icns_path.exists() else None
+
+# Read from version.py rather than importing it, since this .spec file is
+# exec'd by PyInstaller outside the project's normal import path. version.py
+# itself gets stamped with the real release tag by build-macos.yml's "Stamp
+# version from tag" step before this spec runs, for tag-triggered builds.
+_version_match = re.search(r'__version__\s*=\s*"([^"]+)"', Path("version.py").read_text())
+app_version = _version_match.group(1) if _version_match else "0.0.0-dev"
 
 datas = [("excel_template.xlsx", ".")]
 binaries = []
@@ -104,7 +112,7 @@ app = BUNDLE(
     icon=macos_icon,
     bundle_identifier="com.pygmypuff.batteryoptimizer",
     info_plist={
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleShortVersionString": app_version,
         "NSHighResolutionCapable": True,
     },
 )
