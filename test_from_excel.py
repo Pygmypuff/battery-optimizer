@@ -23,15 +23,15 @@ calculator.py imports the `nordpool` package at module scope purely to
 fetch live prices, which isn't needed for offline testing and may not even
 be installed in a test environment. Config values (StationConfig fields,
 total_battery_capacity, bottom_unusable_pct, red_line_threshold) come from
-station_config.py instead, which both this script and calculator.py share
-— editable from the GUI's config window, with no nordpool dependency.
+station_config.py instead, and the actual workbook-writing logic comes from
+excel_output.py — both dependency-light shared modules with no nordpool
+import, so this script and calculator.py can both use them freely.
 
 Optionally also writes a clean, single-sheet formatted .xlsx (schedule
-table + colored bar chart matching calculator.py's chart styling: blue for
-CHARGE, orange for DISCHARGE/sell, grey for HOLD, red price labels below a
-threshold, and a light gradient background marking day segments) built
-from scratch — it does not carry over any of the extra sheets from the
-input workbook.
+table + colored bar chart matching calculator.py's chart styling: red
+price labels below a threshold, and a light gradient background marking
+day segments) built from scratch — it does not carry over any of the extra
+sheets from the input workbook.
 
 Usage:
     python test_from_excel.py path/to/BESS2026_08_06.xlsx
@@ -45,26 +45,12 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import re
-import shutil
-import zipfile
 from dataclasses import dataclass
 
 from openpyxl import load_workbook
-from openpyxl.drawing.colors import ColorChoice, SchemeColor
-from openpyxl.chart.text import RichText
-from openpyxl.drawing.text import (
-    RichTextProperties, ListStyle, Paragraph,
-    ParagraphProperties, CharacterProperties,
-)
 
-from battery_optimizer import (
-    BatteryAction,
-    StationConfig,
-    StationState,
-    optimise_battery_schedule,
-    print_schedule,
-)
+from battery_optimizer import StationState, optimise_battery_schedule, print_schedule
+from excel_output import build_color_map, generate_formatted_excel
 from station_config import calculate_usable_battery_capacity, load_config
 
 # Snapshot for module-level defaults (e.g. the --threshold CLI flag's
@@ -75,27 +61,6 @@ BASE_CFG = _DEFAULT_APP_CFG.station_config()
 total_battery_capacity = _DEFAULT_APP_CFG.total_battery_capacity
 bottom_unusable_pct = _DEFAULT_APP_CFG.bottom_unusable_pct
 red_line_threshold = _DEFAULT_APP_CFG.red_line_threshold
-
-def _color_map(app_cfg) -> dict:
-    """Built fresh from config on every run — see station_config.py's
-    charge_color/discharge_color/hold_color, editable from the GUI's
-    "Customize output chart" window."""
-    return {
-        BatteryAction.CHARGE:    app_cfg.charge_color,
-        BatteryAction.DISCHARGE: app_cfg.discharge_color,
-        BatteryAction.HOLD:      app_cfg.hold_color,
-    }
-
-
-def _make_txPr(hex_color: str) -> RichText:
-    """RichText run properties used to color a chart data-label's text."""
-    rPr = CharacterProperties(sz=1000.0, b=True)
-    rPr.solidFill = ColorChoice()
-    rPr.solidFill.srgbClr = hex_color
-    pPr = ParagraphProperties(defRPr=rPr)
-    para = Paragraph(pPr=pPr, endParaRPr=CharacterProperties())
-    bodyPr = RichTextProperties(rot=-5400000, anchor="ctr", anchorCtr=True)
-    return RichText(bodyPr=bodyPr, lstStyle=ListStyle(), p=[para])
 
 
 # ---------------------------------------------------------------------------
@@ -154,184 +119,6 @@ def read_inputs_from_excel(
         raise ValueError(f"Expected {EXPECTED_SLOTS} prices, got {len(prices)}.")
 
     return ExcelInputs(station_power_mw=station_power_mw, prices=prices, time_labels=time_labels)
-
-
-# ---------------------------------------------------------------------------
-# Formatted .xlsx output — this reuses the REAL excel_template.xlsx that
-# calculator.py itself duplicates and fills in, so the output matches
-# calculator.py's output exactly (same "tabula" sheet layout, same chart,
-# same formatting). These functions are calculator.py's own
-# duplicate_excel/replace_column_c/color_chart_bars/
-# color_label_text_below_threshold/apply_chart_background, unchanged.
-# ---------------------------------------------------------------------------
-
-TEMPLATE_SHEET = "tabula"
-TEMPLATE_FIRST_ROW = 2
-TEMPLATE_ROWS = 140  # rows 2..141
-
-
-def duplicate_excel(src_path: str, dst_path: str) -> None:
-    shutil.copy2(src_path, dst_path)
-
-
-def replace_column_c(filepath: str, values: list[float]) -> None:
-    """Replace values in column C (starting from C2) with the provided list."""
-    if len(values) != TEMPLATE_ROWS:
-        raise ValueError(f"Expected {TEMPLATE_ROWS} values, got {len(values)}")
-
-    wb = load_workbook(filepath)
-    ws = wb[TEMPLATE_SHEET]
-
-    for i, value in enumerate(values):
-        ws.cell(row=i + TEMPLATE_FIRST_ROW, column=3, value=value)
-
-    wb.save(filepath)
-
-
-def color_chart_bars(filepath: str, slots, start_index: int, color_map: dict) -> None:
-    """Colors the bars in the excel chart to match the slot actions."""
-    if len(slots) + start_index != TEMPLATE_ROWS:
-        raise ValueError(f"Expected {TEMPLATE_ROWS - start_index} SlotResults, got {len(slots)}")
-
-    wb = load_workbook(filepath)
-    ws = wb[TEMPLATE_SHEET]
-    chart = ws._charts[0]
-    ser = chart.series[0]
-
-    dpt_by_idx = {pt.idx: pt for pt in ser.dPt}
-
-    for i, slot in enumerate(slots):
-        bar_index = start_index + i
-        pt = dpt_by_idx[bar_index]
-        pt.spPr.solidFill.schemeClr = None
-        pt.spPr.solidFill.srgbClr = color_map[slot.action]
-
-    wb.save(filepath)
-
-
-def _make_txPr_default() -> RichText:
-    solidFill = ColorChoice()
-    solidFill.schemeClr = SchemeColor(val="tx1")
-    rPr = CharacterProperties(sz=1000.0, b=True)
-    rPr.solidFill = solidFill
-    pPr = ParagraphProperties(defRPr=rPr)
-    para = Paragraph(pPr=pPr, endParaRPr=CharacterProperties())
-    bodyPr = RichTextProperties(rot=-5400000, anchor="ctr", anchorCtr=True)
-    return RichText(bodyPr=bodyPr, lstStyle=ListStyle(), p=[para])
-
-
-def color_label_text_below_threshold(
-    filepath: str,
-    values: list[float],
-    threshold: float,
-    sheet_name: str = TEMPLATE_SHEET,
-    chart_index: int = 0,
-    series_index: int = 0,
-) -> None:
-    """Colors the data labels red if they are below threshold."""
-    if len(values) != TEMPLATE_ROWS:
-        raise ValueError(f"Expected {TEMPLATE_ROWS} values, got {len(values)}")
-
-    wb = load_workbook(filepath)
-    ws = wb[sheet_name]
-    chart = ws._charts[chart_index]
-    ser = chart.series[series_index]
-
-    for lbl in ser.dLbls.dLbl:
-        lbl.txPr = _make_txPr("FF0000") if values[lbl.idx] < threshold else _make_txPr_default()
-
-    wb.save(filepath)
-
-
-def apply_chart_background(filepath: str) -> None:
-    """
-    Injects a gradient background into the chart XML to visually distinguish
-    between 24h segments. Call this AFTER all openpyxl wb.save() calls.
-    """
-    s1_end = round(40 / TEMPLATE_ROWS * 100_000)
-    s2_end = round(136 / TEMPLATE_ROWS * 100_000)
-
-    files: dict[str, bytes] = {}
-    with zipfile.ZipFile(filepath, "r") as z:
-        for name in z.namelist():
-            files[name] = z.read(name)
-
-    chart_xml = files["xl/charts/chart1.xml"].decode("utf-8")
-
-    if "</c:plotArea>" in chart_xml:
-        close_tag = "</c:plotArea>"
-        open_spPr = (
-            '<c:spPr'
-            ' xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"'
-            ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
-        )
-        close_spPr = "</c:spPr>"
-    else:
-        close_tag = "</plotArea>"
-        open_spPr = '<spPr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
-        close_spPr = "</spPr>"
-
-    gradient_spPr = (
-        open_spPr
-        + "<a:gradFill><a:gsLst>"
-        + '<a:gs pos="0"><a:srgbClr val="FFFFFF"/></a:gs>'
-        + f'<a:gs pos="{s1_end}"><a:srgbClr val="FFFFFF"/></a:gs>'
-        + f'<a:gs pos="{s1_end + 1}"><a:srgbClr val="E0E0E0"/></a:gs>'
-        + f'<a:gs pos="{s2_end}"><a:srgbClr val="E0E0E0"/></a:gs>'
-        + f'<a:gs pos="{s2_end + 1}"><a:srgbClr val="FFFFFF"/></a:gs>'
-        + '<a:gs pos="100000"><a:srgbClr val="FFFFFF"/></a:gs>'
-        + "</a:gsLst>"
-        + '<a:lin ang="0" scaled="0"/>'
-        + "</a:gradFill>"
-        + "<a:ln><a:noFill/></a:ln>"
-        + close_spPr
-    )
-
-    for open_pat, close_pat in [
-        (r"<c:spPr[^>]*>", r"</c:spPr>\s*</c:plotArea>"),
-        (r"<spPr[^>]*>",   r"</spPr>\s*</plotArea>"),
-    ]:
-        chart_xml = re.sub(
-            open_pat + r".*?" + close_pat,
-            close_tag,
-            chart_xml,
-            count=1,
-            flags=re.DOTALL,
-        )
-
-    chart_xml = chart_xml.replace(close_tag, gradient_spPr + close_tag, 1)
-
-    files["xl/charts/chart1.xml"] = chart_xml.encode("utf-8")
-
-    tmp = filepath + ".tmp"
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
-        for name, data in files.items():
-            zout.writestr(name, data)
-    os.replace(tmp, filepath)
-
-
-def generate_formatted_excel(
-    template_path: str,
-    output_path: str,
-    schedule,
-    prices: list[float],
-    threshold: float = red_line_threshold,
-    color_map: dict | None = None,
-) -> None:
-    print(f"Duplicating template '{template_path}' -> '{output_path}'...")
-    duplicate_excel(template_path, output_path)
-
-    print("Writing prices into template...")
-    replace_column_c(output_path, prices)
-
-    print("Coloring chart bars by action...")
-    color_chart_bars(output_path, schedule, start_index=0, color_map=color_map or _color_map(_DEFAULT_APP_CFG))
-
-    print("Coloring price labels below threshold...")
-    color_label_text_below_threshold(output_path, prices, threshold)
-
-    print("Applying chart background bands...")
-    apply_chart_background(output_path)  # must be called last
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +203,7 @@ def process_one_file(
             schedule=result.schedule,
             prices=inputs.prices,
             threshold=threshold,
-            color_map=_color_map(app_cfg),
+            color_map=build_color_map(app_cfg),
         )
         print(f"Formatted Excel written to {xlsx_out}")
 

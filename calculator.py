@@ -1,36 +1,18 @@
-import copy
-from dataclasses import dataclass
-from enum import Enum
-from openpyxl import load_workbook, Workbook
-from openpyxl.drawing.colors import ColorChoice, SchemeColor
-from openpyxl.chart.text import RichText
-from openpyxl.drawing.text import (
-    RichTextProperties, ListStyle, Paragraph,
-    ParagraphProperties, CharacterProperties
-)
-import pandas as pd
 from pathlib import Path
-from datetime import datetime, time, date
-import math
+from datetime import datetime, date
 from nordpool import elspot
 import pytz
 import bisect
-import shutil
 import os
-import re
-import zipfile
-
 
 from app_paths import bundle_dir, output_dir as default_output_dir
 from battery_optimizer import (
-    BatteryAction,
     StationConfig,
     StationState,
     compute_charge_discharge_ratio,
-    optimise_battery_schedule,
-    print_schedule,
     rerun_for_remaining_day,
 )
+from excel_output import build_color_map, generate_formatted_excel
 from station_config import calculate_usable_battery_capacity, load_config
 
 # Config values (StationConfig fields, total_battery_capacity,
@@ -54,33 +36,6 @@ red_line_threshold = _DEFAULT_APP_CFG.red_line_threshold
 # once frozen by PyInstaller — see app_paths.py.
 SCRIPT_DIR = str(bundle_dir())
 
-# --- Domain types ---
-
-class BatteryAction(str, Enum):
-    CHARGE    = "CHARGE"
-    DISCHARGE = "DISCHARGE"
-    HOLD      = "HOLD"
-
-@dataclass
-class SlotResult:
-    """Outcome for a single 15-minute slot."""
-    slot_index:        int
-    action:            BatteryAction
-    energy_charged:    float   # MWh added to battery         (0 unless CHARGE)
-    energy_discharged: float   # MWh drawn from battery       (0 unless DISCHARGE)
-    power_sold:        float   # MW sold to grid this slot
-    revenue:           float   # EUR earned this slot
-    battery_level_end: float   # MWh in battery at end of slot
-
-def _color_map(app_cfg) -> dict:
-    """Built fresh from config on every run — see station_config.py's
-    charge_color/discharge_color/hold_color, editable from the GUI's
-    "Customize output chart" window."""
-    return {
-        BatteryAction.CHARGE:    app_cfg.charge_color,
-        BatteryAction.DISCHARGE: app_cfg.discharge_color,
-        BatteryAction.HOLD:      app_cfg.hold_color,
-    }
 
 def datetime_to_slot_index(dt: datetime, slots: list[datetime]) -> int:
     """
@@ -169,174 +124,6 @@ def fetch_prices():
     return prices_list
 
 
-def duplicate_excel(src_path: str, dst_path: str) -> None:
-    #duplicate an excel file, preserving all formatting and charts
-    shutil.copy2(src_path, dst_path)
-
-def replace_column_c(filepath: str, values: list[float]) -> None:
-    """
-    Replace values in column C (starting from C2) with the provided list of values.
-    """
-    if len(values) != 140:
-        raise ValueError("Expected 140 values, got {len(values)}")
-
-    wb = load_workbook(filepath)
-    ws = wb["tabula"]
-
-    for i, value in enumerate(values):
-        ws.cell(row=i + 2, column=3, value=value)
-
-    wb.save(filepath)
-
-def color_chart_bars(filepath: str, slots: list[SlotResult], start_index: int, color_map: dict) -> None:
-    """
-    Colors the bars in the excel chart to match the slot actions.
-    """
-    if len(slots) + start_index != 140:
-        raise ValueError(f"Expected {140 - start_index} SlotResults, got {len(slots)}")
-
-    wb = load_workbook(filepath)
-    ws = wb["tabula"]
-    chart = ws._charts[0]
-    ser = chart.series[0]
-
-    dpt_by_idx = {pt.idx: pt for pt in ser.dPt}
-
-    for i, slot in enumerate(slots):
-        bar_index = start_index + i
-        pt = dpt_by_idx[bar_index]
-        pt.spPr.solidFill.schemeClr = None
-        pt.spPr.solidFill.srgbClr = color_map[slot.action]
-
-    wb.save(filepath)
-
-"""
-Helper functions to create a RichText object with the specified hex color for the text.
-"""
-def _make_txPr(hex_color: str) -> RichText:
-    rPr = CharacterProperties(sz=1000.0, b=True)
-    rPr.solidFill = ColorChoice()
-    rPr.solidFill.srgbClr = hex_color
-    pPr = ParagraphProperties(defRPr=rPr)
-    para = Paragraph(pPr=pPr, endParaRPr=CharacterProperties())
-    bodyPr = RichTextProperties(rot=-5400000, anchor="ctr", anchorCtr=True)
-    return RichText(bodyPr=bodyPr, lstStyle=ListStyle(), p=[para])
-
-def _make_txPr_default() -> RichText:
-    solidFill = ColorChoice()
-    solidFill.schemeClr = SchemeColor(val="tx1")
-    rPr = CharacterProperties(sz=1000.0, b=True)
-    rPr.solidFill = solidFill
-    pPr = ParagraphProperties(defRPr=rPr)
-    para = Paragraph(pPr=pPr, endParaRPr=CharacterProperties())
-    bodyPr = RichTextProperties(rot=-5400000, anchor="ctr", anchorCtr=True)
-    return RichText(bodyPr=bodyPr, lstStyle=ListStyle(), p=[para])
-
-
-def color_label_text_below_threshold(
-    filepath: str,
-    values: list[float],
-    threshold: float,
-    sheet_name: str = "tabula",
-    chart_index: int = 0,
-    series_index: int = 0,
-) -> None:
-    """
-    Colors the data labels in the chart red if they are below red-line-threshold.
-    """
-    if len(values) != 140:
-        raise ValueError(f"Expected 140 values, got {len(values)}")
-
-    wb = load_workbook(filepath)
-    ws = wb[sheet_name]
-    chart = ws._charts[chart_index]
-    ser = chart.series[series_index]
-
-    for lbl in ser.dLbls.dLbl:
-        lbl.txPr = _make_txPr("FF0000") if values[lbl.idx] < threshold else _make_txPr_default()
-
-    wb.save(filepath)
-
-def apply_chart_background(filepath: str) -> None:
-    """
-    Injects a gradient background into the chart XML to visually distinguish between 24h segments.
- 
-    IMPORTANT: Call this AFTER all openpyxl wb.save() calls
-    """
-    # Gradient stop positions (units: 1/1000 of a percent, 0–100 000)
-    s1_end = round(40 / 140 * 100_000)   # 28571 — end of first white band
-    s2_end = round(136 / 140 * 100_000)  # 97143 — end of grey band
- 
-    # Read all files from the xlsx zip
-    files: dict[str, bytes] = {}
-    with zipfile.ZipFile(filepath, "r") as z:
-        for name in z.namelist():
-            files[name] = z.read(name)
- 
-    chart_xml = files["xl/charts/chart1.xml"].decode("utf-8")
- 
-    # openpyxl strips namespace prefixes on save (e.g. <c:plotArea> → <plotArea>)
-    # so we detect which form is present and adapt accordingly.
-    if "</c:plotArea>" in chart_xml:
-        close_tag = "</c:plotArea>"
-        open_spPr = (
-            '<c:spPr'
-            ' xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"'
-            ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
-        )
-        close_spPr = "</c:spPr>"
-    else:
-        close_tag = "</plotArea>"
-        open_spPr = '<spPr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
-        close_spPr = "</spPr>"
- 
-    gradient_spPr = (
-        open_spPr
-        + "<a:gradFill><a:gsLst>"
-        + '<a:gs pos="0"><a:srgbClr val="FFFFFF"/></a:gs>'
-        + f'<a:gs pos="{s1_end}"><a:srgbClr val="FFFFFF"/></a:gs>'
-        + f'<a:gs pos="{s1_end + 1}"><a:srgbClr val="E0E0E0"/></a:gs>'
-        + f'<a:gs pos="{s2_end}"><a:srgbClr val="E0E0E0"/></a:gs>'
-        + f'<a:gs pos="{s2_end + 1}"><a:srgbClr val="FFFFFF"/></a:gs>'
-        + '<a:gs pos="100000"><a:srgbClr val="FFFFFF"/></a:gs>'
-        + "</a:gsLst>"
-        + '<a:lin ang="0" scaled="0"/>'
-        + "</a:gradFill>"
-        + "<a:ln><a:noFill/></a:ln>"
-        + close_spPr
-    )
- 
-    # Remove any previously injected plotArea spPr (makes this call idempotent)
-    for open_pat, close_pat in [
-        (r"<c:spPr[^>]*>", r"</c:spPr>\s*</c:plotArea>"),
-        (r"<spPr[^>]*>",   r"</spPr>\s*</plotArea>"),
-    ]:
-        chart_xml = re.sub(
-            open_pat + r".*?" + close_pat,
-            close_tag,
-            chart_xml,
-            count=1,
-            flags=re.DOTALL,
-        )
- 
-    # Inject the gradient spPr immediately before </plotArea>
-    chart_xml = chart_xml.replace(close_tag, gradient_spPr + close_tag, 1)
- 
-    files["xl/charts/chart1.xml"] = chart_xml.encode("utf-8")
- 
-    # Write back atomically
-    tmp = filepath + ".tmp"
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
-        for name, data in files.items():
-            zout.writestr(name, data)
-    os.replace(tmp, filepath)
-
-
-
-
-
-
-
 
 # ── Live (Nordpool) run ──────────────────────────────────────────────────────
 
@@ -396,20 +183,15 @@ def _run_nordpool_from(
     timestamp = datetime.now(target.tzinfo).strftime("%Y%m%d_%H%M%S")
     dst_filepath = str(out_dir / f"output_{timestamp}.xlsx")
 
-    print("Duplicating template file...")
-    duplicate_excel(src_path=src_filepath, dst_path=dst_filepath)
-
-    print("Replacing prices in output file...")
-    replace_column_c(dst_filepath, prices_list["price"])
-
-    print("Coloring chart bars in output file...")
-    color_chart_bars(dst_filepath, result.schedule, start_index=slot_index, color_map=_color_map(app_cfg))
-
-    print("Coloring labels below threshold in output file...")
-    color_label_text_below_threshold(dst_filepath, prices_list["price"], app_cfg.red_line_threshold)
-
-    print("Applying chart background in output file...")
-    apply_chart_background(dst_filepath)  # This must be called last
+    generate_formatted_excel(
+        template_path=src_filepath,
+        output_path=dst_filepath,
+        schedule=result.schedule,
+        prices=prices_list["price"],
+        threshold=app_cfg.red_line_threshold,
+        color_map=build_color_map(app_cfg),
+        start_index=slot_index,
+    )
 
     print(f"Done. Output saved to {dst_filepath}")
     return Path(dst_filepath)
