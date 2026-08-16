@@ -35,8 +35,8 @@ Formulation (`_milp_schedule`)
      as a charge source (y_i=1) or a discharge sink (y_i=0) this run; this
      is what makes it a MILP rather than a plain LP, since a slot
      physically cannot be both in the same 15 minutes.
-  4. Maximise sum(q_ij * profit_per_mwh_ij) — see "Why profit-per-MWh"
-     below — subject to:
+  4. Maximise sum(q_ij * net_profit_per_mwh_ij) — see "What net_profit_per_
+     mwh means, and why Y is subtracted from it" below — subject to:
        - source capacity   : sum_j q_ij <= max_charge_energy * y_i
        - sink capacity     : sum_i q_ij <= max_discharge_energy * (1 - y_j)
        - virtual source cap: sum_j q_(-1,j) <= initial battery_level
@@ -47,8 +47,7 @@ Formulation (`_milp_schedule`)
   combination of pairs, in any order, that a feasible physical schedule
   could realise, and proves it found the best one.
 
-Why profit-per-MWh uses `price[j]*eff - price[i]` and not
-`price[j] - price[i]`
+What net_profit_per_mwh means, and why Y is subtracted from it
 ---------------------------------------------------------------------------
 Charging or discharging a slot is always compared to the counterfactual of
 holding it instead (selling P directly). Working through the algebra:
@@ -56,10 +55,26 @@ holding forgoes `price[i]` of revenue per MWh diverted into the battery at
 slot i (this holds regardless of whether i's overflow_power is 0), and
 discharging nets `price[j] * eff` of extra revenue per MWh drawn from the
 battery at slot j, because only `eff` of what's drawn actually reaches the
-grid (see `discharge_efficiency`). Y itself is still checked on the raw,
-unscaled price spread — that's the human-facing wear threshold the user
-defines it against — only the objective coefficients need the
-efficiency-adjusted figure.
+grid (see `discharge_efficiency`). So the *raw* achieved profit of routing
+one MWh from i to j is `price[j]*eff - price[i]`.
+
+Y is then subtracted from that: `net_profit_per_mwh = price[j]*eff -
+price[i] - Y`. Y isn't merely a pass/fail eligibility cutoff (that's what
+the `price[j] - price[i] >= Y` filter in _build_candidate_pairs is for,
+unchanged, on the raw unscaled spread — a trade that doesn't even clear Y
+once is never worth the wear at all) — it's a genuine per-MWh wear cost,
+charged every time the battery is actually cycled. Consider charging at 3,
+discharging at 6, charging at 6 again, discharging at 9: the gross spread
+captured (3 + 3 = 6) is identical to charging once at 3 and discharging
+once at 9, but the first version pays the wear cost of cycling the battery
+*twice* instead of once. Deducting Y from the objective (not just gating
+on it) makes the solver maximise total wear-adjusted profit rather than
+total gross spread, so it naturally consolidates into the fewest, largest
+cycles the rate/capacity limits allow, instead of fragmenting one big move
+into several smaller Y-clearing hops that individually "pass" but net less
+overall once every cycle's wear is paid for. `total_revenue` on the final
+OptimisationResult is still the true, un-adjusted EUR figure — this
+deduction only shapes *which* schedule gets chosen, not how it's reported.
 
 Rate limits
 -----------
@@ -255,8 +270,23 @@ def _build_candidate_pairs(
     initial_level: float,
 ) -> list[tuple[int, int, float]]:
     """
-    Every (source, sink, profit_per_mwh) triple that clears Y and T.
+    Every (source, sink, net_profit_per_mwh) triple that clears Y and T.
     source == -1 is the pre-existing battery charge (see module docstring).
+
+    net_profit_per_mwh is the *wear-adjusted* profit — the raw achieved
+    profit (pj*eff - pi) minus Y itself, not just pj-pi >= Y as an eligibility
+    cutoff. Y is a per-MWh wear cost, not merely a pass/fail gate: charging
+    at 3 and discharging at 9 nets one Y-cost's worth of wear; charging at 3,
+    discharging at 6, charging at 6 again, discharging at 9 nets the same
+    gross spread but pays the wear cost twice for doing it in two cycles
+    instead of one. Deducting Y from the objective makes the solver prefer
+    the single big cycle whenever it's available — it maximises total
+    wear-adjusted profit, not total gross spread, so needlessly splitting a
+    move into smaller Y-clearing hops is never chosen over one larger hop
+    covering the same ground unless the smaller hops are strictly better
+    (e.g. because rate limits force them to be separate trades regardless).
+    The eligibility cutoff itself (pj - pi >= Y) is unchanged — a trade that
+    doesn't even clear Y once is never worth the wear at all.
     """
     num_slots = len(prices)
     eff = cfg.discharge_efficiency
@@ -272,7 +302,7 @@ def _build_candidate_pairs(
         for j in range(num_slots):
             pj = prices[j]
             if pj - initial_price >= Y and pj >= T:
-                pairs.append((-1, j, pj * eff - initial_price))
+                pairs.append((-1, j, pj * eff - initial_price - Y))
 
     if max_charge_energy > _EPS:
         for i in range(num_slots - 1):
@@ -280,7 +310,7 @@ def _build_candidate_pairs(
             for j in range(i + 1, num_slots):
                 pj = prices[j]
                 if pj - pi >= Y and pj >= T:
-                    pairs.append((i, j, pj * eff - pi))
+                    pairs.append((i, j, pj * eff - pi - Y))
 
     return pairs
 
