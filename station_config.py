@@ -23,6 +23,7 @@ cheap to import from either module.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 
 from app_paths import config_dir
@@ -42,6 +43,18 @@ DEFAULTS: dict[str, float] = {
     "red_line_threshold":     12.5,     # EUR/MWh - price labels below this are colored red
 }
 
+# Output chart bar colors. Hex, no leading "#" (openpyxl's srgbClr wants it
+# bare) — one tint step lighter ("Lighter 40%", the standard Excel color
+# picker tint formula: HSL lightness L' = L*(1-0.4) + 0.4) than the
+# original hardcoded blue/orange/grey.
+COLOR_DEFAULTS: dict[str, str] = {
+    "charge_color":    "8DA5ED",  # was 4169E1
+    "discharge_color": "F4B183",  # was ED7D31
+    "hold_color":      "B4B5B3",  # was 828481
+}
+
+_HEX_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+
 
 @dataclass
 class AppConfig:
@@ -54,6 +67,9 @@ class AppConfig:
     total_battery_capacity: float
     bottom_unusable_pct:    float
     red_line_threshold:     float
+    charge_color:           str
+    discharge_color:        str
+    hold_color:              str
 
     def station_config(self) -> StationConfig:
         return StationConfig(
@@ -67,7 +83,7 @@ class AppConfig:
 
 
 def default_config() -> AppConfig:
-    return AppConfig(**DEFAULTS)
+    return AppConfig(**DEFAULTS, **COLOR_DEFAULTS)
 
 
 def load_config() -> AppConfig:
@@ -84,6 +100,13 @@ def load_config() -> AppConfig:
         value = saved.get(key)
         if isinstance(value, (int, float)):
             merged[key] = float(value)
+
+    merged.update(COLOR_DEFAULTS)
+    for key in COLOR_DEFAULTS:
+        value = saved.get(key)
+        if isinstance(value, str) and _HEX_RE.match(value):
+            merged[key] = value.upper()
+
     return AppConfig(**merged)
 
 

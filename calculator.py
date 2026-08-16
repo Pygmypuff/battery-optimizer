@@ -72,11 +72,15 @@ class SlotResult:
     revenue:           float   # EUR earned this slot
     battery_level_end: float   # MWh in battery at end of slot
 
-COLOR_MAP = {
-    BatteryAction.CHARGE:    "4169E1",  # blue
-    BatteryAction.DISCHARGE: "ED7D31",  # orange
-    BatteryAction.HOLD:      "828481",  # grey
-}
+def _color_map(app_cfg) -> dict:
+    """Built fresh from config on every run — see station_config.py's
+    charge_color/discharge_color/hold_color, editable from the GUI's
+    "Customize output chart" window."""
+    return {
+        BatteryAction.CHARGE:    app_cfg.charge_color,
+        BatteryAction.DISCHARGE: app_cfg.discharge_color,
+        BatteryAction.HOLD:      app_cfg.hold_color,
+    }
 
 def datetime_to_slot_index(dt: datetime, slots: list[datetime]) -> int:
     """
@@ -184,7 +188,7 @@ def replace_column_c(filepath: str, values: list[float]) -> None:
 
     wb.save(filepath)
 
-def color_chart_bars(filepath: str, slots: list[SlotResult], start_index: int) -> None:
+def color_chart_bars(filepath: str, slots: list[SlotResult], start_index: int, color_map: dict) -> None:
     """
     Colors the bars in the excel chart to match the slot actions.
     """
@@ -202,7 +206,7 @@ def color_chart_bars(filepath: str, slots: list[SlotResult], start_index: int) -
         bar_index = start_index + i
         pt = dpt_by_idx[bar_index]
         pt.spPr.solidFill.schemeClr = None
-        pt.spPr.solidFill.srgbClr = COLOR_MAP[slot.action]
+        pt.spPr.solidFill.srgbClr = color_map[slot.action]
 
     wb.save(filepath)
 
@@ -399,7 +403,7 @@ def _run_nordpool_from(
     replace_column_c(dst_filepath, prices_list["price"])
 
     print("Coloring chart bars in output file...")
-    color_chart_bars(dst_filepath, result.schedule, start_index=slot_index)
+    color_chart_bars(dst_filepath, result.schedule, start_index=slot_index, color_map=_color_map(app_cfg))
 
     print("Coloring labels below threshold in output file...")
     color_label_text_below_threshold(dst_filepath, prices_list["price"], app_cfg.red_line_threshold)

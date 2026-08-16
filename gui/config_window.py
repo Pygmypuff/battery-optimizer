@@ -8,9 +8,18 @@ button on the main window. "Save" persists to config.json (so the next run,
 even in a fresh process, uses it); "Reset to Defaults" just repopulates the
 form with the hardcoded defaults — you still need to hit Save to persist
 that. "Cancel" discards whatever's in the form.
+
+Also has a "Customize output chart…" button opening gui.chart_colors_window
+.ChartColorsDialog — a separate window (AppConfig's charge_color/
+discharge_color/hold_color fields aren't shown here). Both dialogs save via
+dataclasses.replace() over a freshly loaded config rather than constructing
+a bare AppConfig from just their own fields, so saving one never clobbers
+fields only the other manages.
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 from PySide6.QtWidgets import (
     QDialog,
@@ -19,9 +28,11 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QMessageBox,
+    QPushButton,
     QVBoxLayout,
 )
 
+from gui.chart_colors_window import ChartColorsDialog
 from station_config import AppConfig, default_config, load_config, save_config
 
 # (attr name, label, suffix, decimals, minimum, maximum, single step)
@@ -62,6 +73,10 @@ class ConfigDialog(QDialog):
         for attr, label, suffix, decimals, lo, hi, step in _OTHER_FIELDS:
             self._add_field(other_form, attr, label, suffix, decimals, lo, hi, step)
         layout.addWidget(other_group)
+
+        self.chart_colors_button = QPushButton("Customize output chart…")
+        self.chart_colors_button.clicked.connect(self._open_chart_colors)
+        layout.addWidget(self.chart_colors_button)
 
         buttons = QDialogButtonBox()
         self.reset_button = buttons.addButton("Reset to Defaults", QDialogButtonBox.ButtonRole.ResetRole)
@@ -104,8 +119,11 @@ class ConfigDialog(QDialog):
         return {attr: box.value() for attr, box in self._spinboxes.items()}
 
     def _save(self) -> None:
-        values = self._current_values()
-        cfg = AppConfig(**values)
+        # Merge into a freshly loaded config rather than constructing a bare
+        # AppConfig from just this dialog's own fields — otherwise saving
+        # station config would blow away chart colors (or whatever else
+        # gets added later) that this dialog doesn't manage.
+        cfg = replace(load_config(), **self._current_values())
         try:
             cfg.station_config()  # validates (e.g. T >= Y, loss_pct in [0, 100))
         except ValueError as exc:
@@ -113,3 +131,6 @@ class ConfigDialog(QDialog):
             return
         save_config(cfg)
         self.accept()
+
+    def _open_chart_colors(self) -> None:
+        ChartColorsDialog(self).exec()

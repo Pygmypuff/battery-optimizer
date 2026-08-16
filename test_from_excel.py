@@ -76,11 +76,15 @@ total_battery_capacity = _DEFAULT_APP_CFG.total_battery_capacity
 bottom_unusable_pct = _DEFAULT_APP_CFG.bottom_unusable_pct
 red_line_threshold = _DEFAULT_APP_CFG.red_line_threshold
 
-COLOR_MAP = {
-    BatteryAction.CHARGE:    "4169E1",  # blue
-    BatteryAction.DISCHARGE: "ED7D31",  # orange
-    BatteryAction.HOLD:      "828481",  # grey
-}
+def _color_map(app_cfg) -> dict:
+    """Built fresh from config on every run — see station_config.py's
+    charge_color/discharge_color/hold_color, editable from the GUI's
+    "Customize output chart" window."""
+    return {
+        BatteryAction.CHARGE:    app_cfg.charge_color,
+        BatteryAction.DISCHARGE: app_cfg.discharge_color,
+        BatteryAction.HOLD:      app_cfg.hold_color,
+    }
 
 
 def _make_txPr(hex_color: str) -> RichText:
@@ -184,7 +188,7 @@ def replace_column_c(filepath: str, values: list[float]) -> None:
     wb.save(filepath)
 
 
-def color_chart_bars(filepath: str, slots, start_index: int) -> None:
+def color_chart_bars(filepath: str, slots, start_index: int, color_map: dict) -> None:
     """Colors the bars in the excel chart to match the slot actions."""
     if len(slots) + start_index != TEMPLATE_ROWS:
         raise ValueError(f"Expected {TEMPLATE_ROWS - start_index} SlotResults, got {len(slots)}")
@@ -200,7 +204,7 @@ def color_chart_bars(filepath: str, slots, start_index: int) -> None:
         bar_index = start_index + i
         pt = dpt_by_idx[bar_index]
         pt.spPr.solidFill.schemeClr = None
-        pt.spPr.solidFill.srgbClr = COLOR_MAP[slot.action]
+        pt.spPr.solidFill.srgbClr = color_map[slot.action]
 
     wb.save(filepath)
 
@@ -312,6 +316,7 @@ def generate_formatted_excel(
     schedule,
     prices: list[float],
     threshold: float = red_line_threshold,
+    color_map: dict | None = None,
 ) -> None:
     print(f"Duplicating template '{template_path}' -> '{output_path}'...")
     duplicate_excel(template_path, output_path)
@@ -320,7 +325,7 @@ def generate_formatted_excel(
     replace_column_c(output_path, prices)
 
     print("Coloring chart bars by action...")
-    color_chart_bars(output_path, schedule, start_index=0)
+    color_chart_bars(output_path, schedule, start_index=0, color_map=color_map or _color_map(_DEFAULT_APP_CFG))
 
     print("Coloring price labels below threshold...")
     color_label_text_below_threshold(output_path, prices, threshold)
@@ -411,6 +416,7 @@ def process_one_file(
             schedule=result.schedule,
             prices=inputs.prices,
             threshold=threshold,
+            color_map=_color_map(app_cfg),
         )
         print(f"Formatted Excel written to {xlsx_out}")
 
